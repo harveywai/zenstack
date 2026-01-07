@@ -2,16 +2,26 @@ package main
 
 import (
 	"fmt"
+	"os" // import os package
+
 	"github.com/harveywai/zenstack/pkg/providers/domain"
 )
 
 func main() {
 	fmt.Println("🚀 ZenStack Asset Scanner starting...")
 
-	// Note: Use environment variables in production!
+	// from environment variables
+	ak := os.Getenv("ALIBABA_CLOUD_ACCESS_KEY_ID")
+	sk := os.Getenv("ALIBABA_CLOUD_ACCESS_KEY_SECRET")
+
+	if ak == "" || sk == "" {
+		fmt.Println("❌ Error: Please set ALIBABA_CLOUD_ACCESS_KEY_ID and SECRET env vars")
+		return
+	}
+
 	p := &domain.AliyunProvider{
-		AccessKey: "YOUR_ACCESS_KEY",
-		SecretKey: "YOUR_SECRET_KEY",
+		AccessKey: ak,
+		SecretKey: sk,
 		Region:    "cn-hangzhou",
 	}
 
