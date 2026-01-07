@@ -1,37 +1,36 @@
-🚀 ZenStack
-ZenStack is a lightweight Internal Developer Platform (IDP) designed for modern SRE and DevOps teams. It eliminates infrastructure complexity by providing self-service capabilities and automated asset management.
+# 🚀 ZenStack
 
-✨ Key Features
-🌐 Domain & SSL Management: Automated discovery of domain assets across multiple cloud providers. Includes real-time SSL certificate monitoring and expiration alerts.
+**ZenStack** is a lightweight Internal Developer Platform (IDP) designed for modern SRE and DevOps teams. It eliminates infrastructure complexity by providing self-service capabilities and automated asset management.
 
-🏗️ Self-Service Infrastructure: Provision cloud resources (RDS, Redis, S3) using simple declarative YAML, powered by Crossplane.
 
-✨ Golden Paths (Scaffolding): Spin up production-ready microservices in seconds with pre-configured CI/CD, monitoring, and security best practices.
 
-🤖 AI-Powered Ops: Built-in LLM integration to diagnose deployment failures and provide root-cause analysis from logs.
+## ✨ Key Features
 
-🛠 Tech Stack
-Backend: Go 1.25+ (High-performance core engine)
+-   **🌐 Domain & SSL Management:** Automated discovery of domain assets across multiple cloud providers (Aliyun, AWS, Cloudflare). Includes real-time SSL certificate monitoring and expiration alerts.
+-   **🏗️ Self-Service Infrastructure:** Provision cloud resources (RDS, Redis, S3) using simple declarative YAML, powered by **Crossplane**.
+-   **✨ Golden Paths (Scaffolding):** Spin up production-ready microservices in seconds with pre-configured CI/CD, monitoring, and security best practices.
+-   **🤖 AI-Powered Ops:** Built-in LLM integration to diagnose deployment failures and provide root-cause analysis from logs.
 
-Portal: Backstage (React/TypeScript)
+## 🛠 Tech Stack
 
-Orchestration: Crossplane & Kubernetes
+-   **Backend:** Go 1.25+ (High-performance core engine)
+-   **Portal:** Backstage (React/TypeScript)
+-   **Orchestration:** Crossplane & Kubernetes
+-   **Database:** PostgreSQL
+-   **Observability:** OpenTelemetry & Prometheus integration
 
-Database: PostgreSQL
+## 📂 Project Structure
 
-Observability: OpenTelemetry & Prometheus integration
-
-📂 Project Structure
-Plaintext
-
+```text
 .
 ├── cmd/server          # Main API server and engine
-├── pkg/providers       # Cloud provider implementations (Aliyun, AWS, etc.)
+├── pkg/providers       # Cloud provider implementations
 │   ├── domain          # Domain discovery & SSL logic
 │   └── infra           # Crossplane resource abstractions
 ├── ui/                 # Frontend portal (Backstage plugins)
 ├── templates/          # Service scaffolding templates
 └── deploy/             # Kubernetes Helm charts & Docker Compose
+
 🚦 Quick Start
 Prerequisites
 Docker & Docker Compose
@@ -42,7 +41,7 @@ Run Locally
 Bash
 
 # Clone the repository
-git clone https://github.com/YOUR_USERNAME/zenstack.git
+git clone [https://github.com/harveywai/zenstack.git](https://github.com/harveywai/zenstack.git)
 cd zenstack
 
 # Start the platform
