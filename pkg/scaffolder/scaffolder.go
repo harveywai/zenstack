@@ -27,10 +27,10 @@ type ServiceConfig struct {
 
 // CreateService scaffolds a new Go/Gin service from a local template and pushes it to GitHub.
 // It performs the following steps:
-//   1. Copies the local template directory to a temporary folder.
-//   2. Applies text templates to selected files (README.md, go.mod, main.go).
-//   3. Creates a new public GitHub repository using the provided GitHub token.
-//   4. Initializes a local git repository and pushes the code to the new GitHub repository.
+//  1. Copies the local template directory to a temporary folder.
+//  2. Applies text templates to selected files (README.md, go.mod, main.go).
+//  3. Creates a new public GitHub repository using the provided GitHub token.
+//  4. Initializes a local git repository and pushes the code to the new GitHub repository.
 func CreateService(ctx context.Context, cfg ServiceConfig) (string, error) {
 	if cfg.ProjectName == "" {
 		return "", fmt.Errorf("project name is required")
@@ -244,8 +244,8 @@ func initAndPushGitRepo(dir string, cfg ServiceConfig, remoteURL string) error {
 
 	// Use HTTPS with personal access token for authentication.
 	auth := &githttp.BasicAuth{
-		Username: "github-token",    // Username is not important for PAT auth, but cannot be empty.
-		Password: cfg.GitHubToken,   // Token is passed as the password.
+		Username: "github-token",  // Username is not important for PAT auth, but cannot be empty.
+		Password: cfg.GitHubToken, // Token is passed as the password.
 	}
 
 	if err := repo.Push(&git.PushOptions{
@@ -257,4 +257,3 @@ func initAndPushGitRepo(dir string, cfg ServiceConfig, remoteURL string) error {
 
 	return nil
 }
-

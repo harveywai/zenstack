@@ -77,9 +77,10 @@ var managedResourceGVR = schema.GroupVersionResource{
 // with the given projectName and maps its status.conditions to a human-readable state.
 //
 // Mapping:
-//   Synced=True && Ready=True -> Available (green)
-//   Ready=False                -> Provisioning (yellow)
-//   Else                       -> Error (red)
+//
+//	Synced=True && Ready=True -> Available (green)
+//	Ready=False                -> Provisioning (yellow)
+//	Else                       -> Error (red)
 //
 // If the resource cannot be found or the cluster cannot be reached, the function returns
 // a status of Unknown (grey) instead of failing.
@@ -198,4 +199,3 @@ func RecordInfrastructureRequest(name, engine, size string) {
 
 	_ = database.DB.Create(&res).Error
 }
-

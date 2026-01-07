@@ -19,10 +19,10 @@ type EndpointMetadata struct {
 
 // APIDoc holds the parsed API specification and derived endpoint metadata.
 type APIDoc struct {
-	ServiceURL string                     `json:"service_url"`
-	Spec       map[string]any             `json:"spec"`
-	Endpoints  []EndpointMetadata         `json:"endpoints"`
-	FetchedAt  time.Time                  `json:"fetched_at"`
+	ServiceURL string             `json:"service_url"`
+	Spec       map[string]any     `json:"spec"`
+	Endpoints  []EndpointMetadata `json:"endpoints"`
+	FetchedAt  time.Time          `json:"fetched_at"`
 }
 
 var (
@@ -146,4 +146,3 @@ func extractEndpoints(spec map[string]any) []EndpointMetadata {
 
 	return endpoints
 }
-

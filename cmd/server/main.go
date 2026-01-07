@@ -1,12 +1,16 @@
 package main
 
 import (
+	"crypto/tls"
 	"fmt"
 	"log"
+	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/fatih/color"
 	"github.com/gin-gonic/gin"
@@ -15,6 +19,7 @@ import (
 	"github.com/harveywai/zenstack/pkg/database"
 	"github.com/harveywai/zenstack/pkg/infra"
 	"github.com/harveywai/zenstack/pkg/middleware"
+	"github.com/harveywai/zenstack/pkg/notify"
 	"github.com/harveywai/zenstack/pkg/providers/domain"
 	"github.com/harveywai/zenstack/pkg/scaffolder"
 )
@@ -27,6 +32,14 @@ const (
 	// warningThreshold defines the days remaining threshold for warning status
 	warningThreshold = 30
 )
+
+// SSLScanResult represents the result of a deep SSL certificate scan
+type SSLScanResult struct {
+	DomainName    string
+	ExpiryDate    time.Time
+	DaysRemaining int
+	IsReachable   bool
+}
 
 // ScanResultWithStatus extends ScanResult with security status information
 type ScanResultWithStatus struct {
@@ -74,6 +87,9 @@ func main() {
 	v1.Use(middleware.AuthMiddleware())
 	{
 		v1.GET("/scan", handleScan)
+		v1.GET("/domains", handleListDomains)
+		v1.PUT("/domains/:id/auto-renew", handleUpdateAutoRenew)
+		v1.POST("/domains/:id/renew", handleManualRenew)
 		v1.POST("/projects", handleCreateProject)
 		v1.GET("/projects", handleListProjects)
 		v1.GET("/infra/options", handleInfraOptions)
@@ -92,7 +108,43 @@ func main() {
 		v1Admin.POST("/users", handleCreateUser)
 		v1Admin.POST("/users/:id/approve", handleApproveUser)
 		v1Admin.POST("/users/:id/reject", handleRejectUser)
+		v1Admin.GET("/dashboard/stats", handleDashboardStats)
+
+		// Notification configuration endpoints
+		v1Admin.GET("/notifications/configs", handleListNotificationConfigs)
+		v1Admin.POST("/notifications/configs", handleCreateNotificationConfig)
+		v1Admin.PUT("/notifications/configs/:id", handleUpdateNotificationConfig)
+		v1Admin.DELETE("/notifications/configs/:id", handleDeleteNotificationConfig)
+
+		// Message template endpoints
+		v1Admin.GET("/notifications/templates", handleListMessageTemplates)
+		v1Admin.POST("/notifications/templates", handleCreateMessageTemplate)
+		v1Admin.PUT("/notifications/templates/:id", handleUpdateMessageTemplate)
+		v1Admin.DELETE("/notifications/templates/:id", handleDeleteMessageTemplate)
+
+		// Telegram notification config endpoints
+		v1Admin.GET("/notifications/telegram", handleListTelegramConfigs)
+		v1Admin.POST("/notifications/telegram", handleCreateTelegramConfig)
+		v1Admin.PUT("/notifications/telegram/:id", handleUpdateTelegramConfig)
+		v1Admin.DELETE("/notifications/telegram/:id", handleDeleteTelegramConfig)
+		v1Admin.POST("/notifications/telegram/:id/test", handleTestTelegramConnection)
+
+		// Settings endpoints (simplified API for Telegram configuration)
+		v1Admin.POST("/settings/telegram", handleSaveTelegramSettings)
 	}
+
+	// Dashboard stats endpoint (Admin only) - legacy endpoint for backward compatibility
+	v1Dashboard := r.Group("/v1/dashboard")
+	v1Dashboard.Use(middleware.AuthMiddleware(), middleware.RoleMiddleware("admin"))
+	{
+		v1Dashboard.GET("/stats", handleDashboardStats)
+	}
+
+	// Start background SSL monitoring task
+	go startSSLScanner()
+
+	// Start background HTTP health monitoring worker
+	go startLiveMonitor()
 
 	// Start server
 	r.Run(":8080")
@@ -109,6 +161,81 @@ func handleDashboard(c *gin.Context) {
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>ZenStack - Internal Developer Platform</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @keyframes pulse-red {
+            0%, 100% {
+                background-color: rgba(239, 68, 68, 0.1);
+                border-left-color: rgb(239, 68, 68);
+            }
+            50% {
+                background-color: rgba(239, 68, 68, 0.2);
+                border-left-color: rgb(220, 38, 38);
+            }
+        }
+        .pulse-critical {
+            animation: pulse-red 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+        }
+        @keyframes breathe-green {
+            0%, 100% {
+                opacity: 1;
+                box-shadow: 0 0 8px rgba(34, 197, 94, 0.6);
+            }
+            50% {
+                opacity: 0.6;
+                box-shadow: 0 0 16px rgba(34, 197, 94, 0.9);
+            }
+        }
+        @keyframes breathe-red {
+            0%, 100% {
+                opacity: 1;
+                box-shadow: 0 0 8px rgba(239, 68, 68, 0.6);
+            }
+            50% {
+                opacity: 0.6;
+                box-shadow: 0 0 16px rgba(239, 68, 68, 0.9);
+            }
+        }
+        @keyframes blink-red {
+            0%, 100% {
+                opacity: 1;
+                box-shadow: 0 0 8px rgba(239, 68, 68, 0.8);
+            }
+            50% {
+                opacity: 0.3;
+                box-shadow: 0 0 20px rgba(239, 68, 68, 1);
+            }
+        }
+        @keyframes breathe-yellow {
+            0%, 100% {
+                opacity: 1;
+                box-shadow: 0 0 8px rgba(234, 179, 8, 0.6);
+            }
+            50% {
+                opacity: 0.6;
+                box-shadow: 0 0 16px rgba(234, 179, 8, 0.9);
+            }
+        }
+        .live-indicator {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            margin-right: 6px;
+            vertical-align: middle;
+        }
+        .live-indicator.live {
+            background-color: rgb(34, 197, 94);
+            animation: breathe-green 2s ease-in-out infinite;
+        }
+        .live-indicator.down {
+            background-color: rgb(239, 68, 68);
+            animation: blink-red 1s ease-in-out infinite;
+        }
+        .live-indicator.warning {
+            background-color: rgb(234, 179, 8);
+            animation: breathe-yellow 2s ease-in-out infinite;
+        }
+    </style>
 </head>
 <body class="min-h-screen bg-slate-950 text-slate-100">
     <div class="min-h-screen flex bg-slate-950 text-slate-100">
@@ -125,9 +252,17 @@ func handleDashboard(c *gin.Context) {
             </div>
             <nav class="flex-1 px-3 py-4 space-y-1 text-sm">
                 <button
+                    id="nav-dashboard"
+                    data-view="dashboard"
+                    class="w-full flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-800 text-slate-50 font-medium"
+                >
+                    <span class="h-2 w-2 rounded-full bg-purple-400"></span>
+                    Dashboard
+                </button>
+                <button
                     id="nav-assets"
                     data-view="assets"
-                    class="w-full flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-800 text-slate-50 font-medium"
+                    class="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-slate-300 hover:bg-slate-800/60"
                 >
                     <span class="h-2 w-2 rounded-full bg-emerald-400"></span>
                     Assets
@@ -155,6 +290,14 @@ func handleDashboard(c *gin.Context) {
                 >
                     <span class="h-2 w-2 rounded-full bg-rose-400"></span>
                     User Management
+                </button>
+                <button
+                    id="nav-notifications"
+                    data-view="notifications"
+                    class="hidden w-full flex items-center gap-2 px-3 py-2 rounded-lg text-slate-300 hover:bg-slate-800/60"
+                >
+                    <span class="h-2 w-2 rounded-full bg-indigo-400"></span>
+                    Notifications
                 </button>
             </nav>
             <div class="px-4 py-3 border-t border-slate-800 text-[11px] text-slate-500 space-y-1">
@@ -193,8 +336,118 @@ func handleDashboard(c *gin.Context) {
 
             <main class="flex-1">
                 <div class="max-w-6xl mx-auto px-4 py-8 space-y-6">
+                    <!-- Dashboard View -->
+                    <section id="view-dashboard" class="space-y-6">
+                        <!-- Statistic Cards -->
+                        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
+                            <div class="bg-gradient-to-br from-emerald-500/20 to-emerald-600/10 border border-emerald-500/30 rounded-2xl p-6 shadow-xl shadow-emerald-500/10">
+                                <div class="flex items-center justify-between">
+                                    <div>
+                                        <p class="text-xs text-emerald-300/80 font-medium mb-1">Total Assets</p>
+                                        <p id="stat-total-domains" class="text-3xl font-bold text-emerald-400">-</p>
+                                    </div>
+                                    <div class="h-12 w-12 rounded-xl bg-emerald-500/20 flex items-center justify-center">
+                                        <svg class="h-6 w-6 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9"></path>
+                                        </svg>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="bg-gradient-to-br from-red-500/20 to-red-600/10 border border-red-500/30 rounded-2xl p-6 shadow-xl shadow-red-500/10">
+                                <div class="flex items-center justify-between">
+                                    <div>
+                                        <p class="text-xs text-red-300/80 font-medium mb-1">SSL Critical</p>
+                                        <p id="stat-ssl-critical" class="text-3xl font-bold text-red-400">-</p>
+                                    </div>
+                                    <div class="h-12 w-12 rounded-xl bg-red-500/20 flex items-center justify-center">
+                                        <svg class="h-6 w-6 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path>
+                                        </svg>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="bg-gradient-to-br from-amber-500/20 to-amber-600/10 border border-amber-500/30 rounded-2xl p-6 shadow-xl shadow-amber-500/10">
+                                <div class="flex items-center justify-between">
+                                    <div>
+                                        <p class="text-xs text-amber-300/80 font-medium mb-1">SSL Warning</p>
+                                        <p id="stat-ssl-warning" class="text-3xl font-bold text-amber-400">-</p>
+                                    </div>
+                                    <div class="h-12 w-12 rounded-xl bg-amber-500/20 flex items-center justify-center">
+                                        <svg class="h-6 w-6 text-amber-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                                        </svg>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="bg-gradient-to-br from-sky-500/20 to-sky-600/10 border border-sky-500/30 rounded-2xl p-6 shadow-xl shadow-sky-500/10">
+                                <div class="flex items-center justify-between">
+                                    <div>
+                                        <p class="text-xs text-sky-300/80 font-medium mb-1">Projects</p>
+                                        <p id="stat-project-count" class="text-3xl font-bold text-sky-400">-</p>
+                                    </div>
+                                    <div class="h-12 w-12 rounded-xl bg-sky-500/20 flex items-center justify-center">
+                                        <svg class="h-6 w-6 text-sky-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path>
+                                        </svg>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="bg-gradient-to-br from-purple-500/20 to-purple-600/10 border border-purple-500/30 rounded-2xl p-6 shadow-xl shadow-purple-500/10">
+                                <div class="flex items-center justify-between">
+                                    <div>
+                                        <p class="text-xs text-purple-300/80 font-medium mb-1">Global Availability</p>
+                                        <p id="stat-global-availability" class="text-3xl font-bold text-purple-400">-</p>
+                                    </div>
+                                    <div class="h-12 w-12 rounded-xl bg-purple-500/20 flex items-center justify-center">
+                                        <svg class="h-6 w-6 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                                        </svg>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="bg-gradient-to-br from-red-500/20 to-red-600/10 border border-red-500/30 rounded-2xl p-6 shadow-xl shadow-red-500/10">
+                                <div class="flex items-center justify-between">
+                                    <div>
+                                        <p class="text-xs text-red-300/80 font-medium mb-1">Sites Down</p>
+                                        <p id="stat-sites-down" class="text-3xl font-bold text-red-400">-</p>
+                                    </div>
+                                    <div class="h-12 w-12 rounded-xl bg-red-500/20 flex items-center justify-center">
+                                        <svg class="h-6 w-6 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636"></path>
+                                        </svg>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Charts Section -->
+                        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                            <!-- Doughnut Chart: Domain Suffix Distribution -->
+                            <section class="bg-slate-900/60 border border-slate-800 rounded-2xl shadow-xl shadow-slate-950/40 p-6 space-y-4">
+                                <div>
+                                    <h3 class="text-sm font-semibold tracking-tight">Domain Suffix Distribution</h3>
+                                    <p class="text-xs text-slate-400 mt-1">Distribution of domains by TLD suffix (e.g., .com, .io, .jp)</p>
+                                </div>
+                                <div class="h-64 flex items-center justify-center">
+                                    <canvas id="project-types-chart"></canvas>
+                                </div>
+                            </section>
+
+                            <!-- Bar Chart: Domains Expiry by Month -->
+                            <section class="bg-slate-900/60 border border-slate-800 rounded-2xl shadow-xl shadow-slate-950/40 p-6 space-y-4">
+                                <div>
+                                    <h3 class="text-sm font-semibold tracking-tight">Domains Expiry by Month</h3>
+                                    <p class="text-xs text-slate-400 mt-1">Number of domains with SSL certificates expiring each month (next 12 months)</p>
+                                </div>
+                                <div class="h-64 flex items-center justify-center">
+                                    <canvas id="domain-status-chart"></canvas>
+                                </div>
+                            </section>
+                        </div>
+                    </section>
+
                     <!-- Assets View: Domain & SSL Scanner -->
-                    <section id="view-assets" class="space-y-6">
+                    <section id="view-assets" class="space-y-6 hidden">
                         <section class="bg-slate-900/60 border border-slate-800 rounded-2xl shadow-xl shadow-slate-950/40 p-6 space-y-4">
                             <div class="flex items-center justify-between gap-4 flex-wrap">
                                 <div>
@@ -296,6 +549,47 @@ func handleDashboard(c *gin.Context) {
                                         <tr>
                                             <td colspan="8" class="px-3 py-6 text-center text-xs text-slate-500">
                                                 No data yet. Run a scan to populate this table.
+                                            </td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </section>
+
+                        <!-- Monitored Domains List -->
+                        <section class="bg-slate-900/60 border border-slate-800 rounded-2xl shadow-xl shadow-slate-950/40 p-6 space-y-4">
+                            <div class="flex items-center justify-between gap-3 flex-wrap">
+                                <div>
+                                    <h3 class="text-sm font-semibold tracking-tight">Monitored Domains</h3>
+                                    <p class="text-xs text-slate-400">
+                                        Domains saved in database with SSL monitoring. Auto-scanned every 6 hours.
+                                    </p>
+                                </div>
+                                <button
+                                    id="refresh-domains"
+                                    class="inline-flex items-center gap-1 rounded-lg border border-slate-700 px-3 py-1.5 text-[11px] text-slate-200 hover:bg-slate-800/80"
+                                >
+                                    Refresh
+                                </button>
+                            </div>
+                            <div class="overflow-hidden rounded-xl border border-slate-800 bg-slate-950/60">
+                                <table class="min-w-full divide-y divide-slate-800 text-sm">
+                                    <thead class="bg-slate-900/80">
+                                        <tr>
+                                            <th class="px-3 py-2 text-left text-xs font-semibold text-slate-400">Domain</th>
+                                            <th class="px-3 py-2 text-left text-xs font-semibold text-slate-400">Live Status</th>
+                                            <th class="px-3 py-2 text-left text-xs font-semibold text-slate-400">SSL Status</th>
+                                            <th class="px-3 py-2 text-left text-xs font-semibold text-slate-400">SSL Expiry</th>
+                                            <th class="px-3 py-2 text-left text-xs font-semibold text-slate-400">Days Remaining</th>
+                                            <th class="px-3 py-2 text-left text-xs font-semibold text-slate-400">Last Check</th>
+                                            <th class="px-3 py-2 text-left text-xs font-semibold text-slate-400">Auto-Renew</th>
+                                            <th class="px-3 py-2 text-left text-xs font-semibold text-slate-400">Actions</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="domains-body" class="divide-y divide-slate-900/80">
+                                        <tr>
+                                            <td colspan="8" class="px-3 py-6 text-center text-xs text-slate-500">
+                                                Loading domains...
                                             </td>
                                         </tr>
                                     </tbody>
@@ -549,6 +843,194 @@ func handleDashboard(c *gin.Context) {
                             </section>
                             </div>
                         </section>
+
+                        <!-- Notifications View: Admin only -->
+                        <section id="view-notifications" class="space-y-6 hidden">
+                            <!-- Telegram Configuration Section -->
+                            <section class="bg-slate-900/60 border border-slate-800 rounded-2xl shadow-xl shadow-slate-950/40 p-6 space-y-4">
+                                <div class="flex items-center justify-between gap-3 flex-wrap">
+                                    <div>
+                                        <h2 class="text-base font-semibold tracking-tight">Telegram Bot Configuration</h2>
+                                        <p class="text-xs text-slate-400 mt-1">
+                                            Configure Telegram bot token and chat ID for notifications
+                                        </p>
+                                    </div>
+                                </div>
+                                
+                                <!-- Telegram Config Form -->
+                                <div class="bg-slate-950/60 border border-slate-800 rounded-xl p-4 space-y-4">
+                                    <form id="telegram-config-form" class="space-y-3">
+                                        <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                            <div>
+                                                <label class="block text-xs font-medium text-slate-300 mb-1" for="tg-bot-token">
+                                                    Bot Token
+                                                </label>
+                                                <input
+                                                    id="tg-bot-token"
+                                                    type="text"
+                                                    class="w-full rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/70 focus:border-emerald-500/70"
+                                                    placeholder="123456789:ABCdefGHIjklMNOpqrsTUVwxyz"
+                                                />
+                                            </div>
+                                            <div>
+                                                <label class="block text-xs font-medium text-slate-300 mb-1" for="tg-chat-id">
+                                                    Chat ID
+                                                </label>
+                                                <input
+                                                    id="tg-chat-id"
+                                                    type="text"
+                                                    class="w-full rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/70 focus:border-emerald-500/70"
+                                                    placeholder="-1001234567890"
+                                                />
+                                            </div>
+                                        </div>
+                                        <div class="flex items-center justify-between">
+                                            <label class="flex items-center gap-2 text-xs font-medium text-slate-300">
+                                                <input
+                                                    id="tg-is-active"
+                                                    type="checkbox"
+                                                    class="rounded border-slate-700 bg-slate-950/60 text-emerald-500 focus:ring-2 focus:ring-emerald-500/70"
+                                                    checked
+                                                />
+                                                Active
+                                            </label>
+                                            <div class="flex items-center gap-2">
+                                                <button
+                                                    type="button"
+                                                    id="test-telegram-btn"
+                                                    class="inline-flex items-center gap-1 rounded-lg border border-slate-700 px-3 py-1.5 text-[11px] text-sky-300 hover:bg-sky-500/10"
+                                                >
+                                                    Test TG Notification
+                                                </button>
+                                                <button
+                                                    type="submit"
+                                                    id="save-telegram-config-btn"
+                                                    class="inline-flex items-center gap-2 rounded-lg bg-emerald-500 px-4 py-2 text-xs font-medium text-slate-950 shadow-lg shadow-emerald-500/25 hover:bg-emerald-400 focus:outline-none focus:ring-2 focus:ring-emerald-500/70 disabled:opacity-60 disabled:cursor-not-allowed"
+                                                >
+                                                    Save Config
+                                                </button>
+                                            </div>
+                                        </div>
+                                        <p id="telegram-config-error" class="text-[11px] text-rose-400 min-h-[1.25rem]"></p>
+                                        <p id="telegram-config-success" class="text-[11px] text-emerald-400 min-h-[1.25rem]"></p>
+                                    </form>
+                                </div>
+
+                                <!-- Existing Telegram Configs List -->
+                                <div class="overflow-hidden rounded-xl border border-slate-800 bg-slate-950/60">
+                                    <table class="min-w-full divide-y divide-slate-800 text-sm">
+                                        <thead class="bg-slate-900/80">
+                                            <tr>
+                                                <th class="px-3 py-2 text-left text-xs font-semibold text-slate-400">Chat ID</th>
+                                                <th class="px-3 py-2 text-left text-xs font-semibold text-slate-400">Status</th>
+                                                <th class="px-3 py-2 text-left text-xs font-semibold text-slate-400">Actions</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody id="telegram-configs-body" class="divide-y divide-slate-900/80">
+                                            <tr>
+                                                <td colspan="3" class="px-3 py-6 text-center text-xs text-slate-500">
+                                                    Loading Telegram configs...
+                                                </td>
+                                            </tr>
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </section>
+
+                            <!-- Message Templates Section -->
+                            <section class="bg-slate-900/60 border border-slate-800 rounded-2xl shadow-xl shadow-slate-950/40 p-6 space-y-4">
+                                <div class="flex items-center justify-between gap-3 flex-wrap">
+                                    <div>
+                                        <h2 class="text-base font-semibold tracking-tight">Message Templates</h2>
+                                        <p class="text-xs text-slate-400 mt-1">
+                                            Edit notification message templates for Site Down and SSL Expiring events
+                                        </p>
+                                    </div>
+                                </div>
+                                <div id="template-editor-container" class="space-y-4">
+                                    <!-- Site Down Template Editor -->
+                                    <div class="bg-slate-950/60 border border-slate-800 rounded-xl p-4 space-y-3">
+                                        <div class="flex items-center justify-between">
+                                            <h3 class="text-sm font-semibold text-slate-200">Site Down Template</h3>
+                                            <button
+                                                id="save-sitedown-template"
+                                                class="inline-flex items-center gap-1 rounded-lg bg-emerald-500 px-3 py-1.5 text-[11px] font-medium text-slate-950 hover:bg-emerald-400"
+                                            >
+                                                Save
+                                            </button>
+                                        </div>
+                                        <textarea
+                                            id="sitedown-template-text"
+                                            rows="3"
+                                            class="w-full rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/70 focus:border-emerald-500/70"
+                                            placeholder="🚨 告警：站点 {{domain}} 无法访问！状态码：{{status}}"
+                                        ></textarea>
+                                        <p class="text-[11px] text-slate-500">
+                                            Available variables: {{domain}}, {{status}}, {{status_code}}, {{code}}
+                                        </p>
+                                    </div>
+                                    
+                                    <!-- SSL Expiring Template Editor -->
+                                    <div class="bg-slate-950/60 border border-slate-800 rounded-xl p-4 space-y-3">
+                                        <div class="flex items-center justify-between">
+                                            <h3 class="text-sm font-semibold text-slate-200">SSL Expiring Template</h3>
+                                            <button
+                                                id="save-sslexpired-template"
+                                                class="inline-flex items-center gap-1 rounded-lg bg-emerald-500 px-3 py-1.5 text-[11px] font-medium text-slate-950 hover:bg-emerald-400"
+                                            >
+                                                Save
+                                            </button>
+                                        </div>
+                                        <textarea
+                                            id="sslexpired-template-text"
+                                            rows="3"
+                                            class="w-full rounded-lg border border-slate-800 bg-slate-900/60 px-3 py-2 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/70 focus:border-emerald-500/70"
+                                            placeholder="🔒 证书预警：域名 {{domain}} 的 SSL 证书将在 {{days}} 天后过期。"
+                                        ></textarea>
+                                        <p class="text-[11px] text-slate-500">
+                                            Available variables: {{domain}}, {{days}}, {{days_remaining}}, {{expiry}}
+                                        </p>
+                                    </div>
+                                </div>
+                            </section>
+
+                            <!-- Webhook Configurations Section (kept for backward compatibility) -->
+                            <section class="bg-slate-900/60 border border-slate-800 rounded-2xl shadow-xl shadow-slate-950/40 p-6 space-y-4">
+                                <div class="flex items-center justify-between gap-3 flex-wrap">
+                                    <div>
+                                        <h2 class="text-base font-semibold tracking-tight">Webhook Configurations</h2>
+                                        <p class="text-xs text-slate-400 mt-1">
+                                            Configure webhook URLs for notification platforms (DingTalk, Feishu, Slack, etc.)
+                                        </p>
+                                    </div>
+                                    <button
+                                        id="open-add-notification-config"
+                                        class="inline-flex items-center gap-2 rounded-xl bg-emerald-500 px-4 py-2 text-xs font-medium text-slate-950 shadow-lg shadow-emerald-500/25 hover:bg-emerald-400 focus:outline-none focus:ring-2 focus:ring-emerald-500/70 transition hidden"
+                                    >
+                                        <span class="text-sm">Add Config</span>
+                                    </button>
+                                </div>
+                                <div class="overflow-hidden rounded-xl border border-slate-800 bg-slate-950/60">
+                                    <table class="min-w-full divide-y divide-slate-800 text-sm">
+                                        <thead class="bg-slate-900/80">
+                                            <tr>
+                                                <th class="px-3 py-2 text-left text-xs font-semibold text-slate-400">Platform</th>
+                                                <th class="px-3 py-2 text-left text-xs font-semibold text-slate-400">Webhook URL</th>
+                                                <th class="px-3 py-2 text-left text-xs font-semibold text-slate-400">Status</th>
+                                                <th class="px-3 py-2 text-left text-xs font-semibold text-slate-400">Actions</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody id="notification-configs-body" class="divide-y divide-slate-900/80">
+                                            <tr>
+                                                <td colspan="4" class="px-3 py-6 text-center text-xs text-slate-500">
+                                                    Loading notification configs...
+                                                </td>
+                                            </tr>
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </section>
+                        </section>
                 </div>
             </main>
 
@@ -797,6 +1279,262 @@ func handleDashboard(c *gin.Context) {
         </div>
     </div>
 
+    <!-- Add Notification Config Modal -->
+    <div
+        id="add-notification-config-modal"
+        class="fixed inset-0 hidden z-40 items-center justify-center bg-slate-950/70 backdrop-blur-sm"
+        aria-hidden="true"
+    >
+        <div class="w-full max-w-sm rounded-2xl border border-slate-800 bg-slate-900 shadow-xl shadow-black/50 p-6 space-y-4">
+            <div class="flex items-center justify-between mb-3">
+                <div>
+                    <h2 class="text-sm font-semibold tracking-tight">Add Notification Config</h2>
+                    <p class="text-[11px] text-slate-400">
+                        Configure a webhook URL for notification platforms (DingTalk, Feishu, Slack, etc.)
+                    </p>
+                </div>
+                <button
+                    id="add-notification-config-close"
+                    class="text-slate-400 hover:text-slate-100 text-xs"
+                    aria-label="Close modal"
+                >
+                    ✕
+                </button>
+            </div>
+            <form id="add-notification-config-form" class="space-y-3">
+                <div>
+                    <label class="block text-xs font-medium text-slate-300" for="config-platform">
+                        Platform
+                    </label>
+                    <select
+                        id="config-platform"
+                        class="mt-1 w-full rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs text-slate-100 focus:outline-none focus:ring-2 focus:ring-emerald-500/70 focus:border-emerald-500/70"
+                        required
+                    >
+                        <option value="">Select Platform</option>
+                        <option value="DingTalk">DingTalk</option>
+                        <option value="Feishu">Feishu</option>
+                        <option value="Slack">Slack</option>
+                        <option value="Webhook">Generic Webhook</option>
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-xs font-medium text-slate-300" for="config-webhook-url">
+                        Webhook URL
+                    </label>
+                    <input
+                        id="config-webhook-url"
+                        type="url"
+                        class="mt-1 w-full rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/70 focus:border-emerald-500/70"
+                        placeholder="https://..."
+                        required
+                    />
+                </div>
+                <div>
+                    <label class="block text-xs font-medium text-slate-300" for="config-secret-key">
+                        Secret Key (Optional)
+                    </label>
+                    <input
+                        id="config-secret-key"
+                        type="password"
+                        class="mt-1 w-full rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/70 focus:border-emerald-500/70"
+                        placeholder="••••••••"
+                    />
+                </div>
+                <div>
+                    <label class="flex items-center gap-2 text-xs font-medium text-slate-300">
+                        <input
+                            id="config-is-active"
+                            type="checkbox"
+                            class="rounded border-slate-700 bg-slate-950/60 text-emerald-500 focus:ring-2 focus:ring-emerald-500/70"
+                            checked
+                        />
+                        Active
+                    </label>
+                </div>
+                <p id="add-notification-config-error" class="text-[11px] text-rose-400 min-h-[1.25rem]"></p>
+                <div class="flex items-center justify-end gap-2">
+                    <button
+                        type="button"
+                        id="add-notification-config-cancel"
+                        class="rounded-lg border border-slate-700 px-3 py-1.5 text-[11px] text-slate-300 hover:bg-slate-800/80"
+                    >
+                        Cancel
+                    </button>
+                    <button
+                        type="submit"
+                        id="add-notification-config-submit"
+                        class="inline-flex items-center gap-2 rounded-lg bg-emerald-500 px-3 py-1.5 text-[11px] font-medium text-slate-950 shadow-lg shadow-emerald-500/25 hover:bg-emerald-400 focus:outline-none focus:ring-2 focus:ring-emerald-500/70 disabled:opacity-60 disabled:cursor-not-allowed"
+                    >
+                        <span>Add Config</span>
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Add Telegram Config Modal -->
+    <div
+        id="add-telegram-config-modal"
+        class="fixed inset-0 hidden z-40 items-center justify-center bg-slate-950/70 backdrop-blur-sm"
+        aria-hidden="true"
+    >
+        <div class="w-full max-w-sm rounded-2xl border border-slate-800 bg-slate-900 shadow-xl shadow-black/50 p-6 space-y-4">
+            <div class="flex items-center justify-between mb-3">
+                <div>
+                    <h2 class="text-sm font-semibold tracking-tight">Add Telegram Config</h2>
+                    <p class="text-[11px] text-slate-400">
+                        Configure Telegram bot token and chat ID for notifications
+                    </p>
+                </div>
+                <button
+                    id="add-telegram-config-close"
+                    class="text-slate-400 hover:text-slate-100 text-xs"
+                    aria-label="Close modal"
+                >
+                    ✕
+                </button>
+            </div>
+            <form id="add-telegram-config-form" class="space-y-3">
+                <div>
+                    <label class="block text-xs font-medium text-slate-300" for="telegram-token">
+                        Bot Token
+                    </label>
+                    <input
+                        id="telegram-token"
+                        type="text"
+                        class="mt-1 w-full rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/70 focus:border-emerald-500/70"
+                        placeholder="123456789:ABCdefGHIjklMNOpqrsTUVwxyz"
+                        required
+                    />
+                </div>
+                <div>
+                    <label class="block text-xs font-medium text-slate-300" for="telegram-chat-id">
+                        Chat ID
+                    </label>
+                    <input
+                        id="telegram-chat-id"
+                        type="text"
+                        class="mt-1 w-full rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/70 focus:border-emerald-500/70"
+                        placeholder="-1001234567890"
+                        required
+                    />
+                </div>
+                <div>
+                    <label class="flex items-center gap-2 text-xs font-medium text-slate-300">
+                        <input
+                            id="telegram-is-active"
+                            type="checkbox"
+                            class="rounded border-slate-700 bg-slate-950/60 text-emerald-500 focus:ring-2 focus:ring-emerald-500/70"
+                            checked
+                        />
+                        Active
+                    </label>
+                </div>
+                <p id="add-telegram-config-error" class="text-[11px] text-rose-400 min-h-[1.25rem]"></p>
+                <div class="flex items-center justify-end gap-2">
+                    <button
+                        type="button"
+                        id="add-telegram-config-cancel"
+                        class="rounded-lg border border-slate-700 px-3 py-1.5 text-[11px] text-slate-300 hover:bg-slate-800/80"
+                    >
+                        Cancel
+                    </button>
+                    <button
+                        type="submit"
+                        id="add-telegram-config-submit"
+                        class="inline-flex items-center gap-2 rounded-lg bg-emerald-500 px-3 py-1.5 text-[11px] font-medium text-slate-950 shadow-lg shadow-emerald-500/25 hover:bg-emerald-400 focus:outline-none focus:ring-2 focus:ring-emerald-500/70 disabled:opacity-60 disabled:cursor-not-allowed"
+                    >
+                        <span>Add Config</span>
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Add Message Template Modal -->
+    <div
+        id="add-template-modal"
+        class="fixed inset-0 hidden z-40 items-center justify-center bg-slate-950/70 backdrop-blur-sm"
+        aria-hidden="true"
+    >
+        <div class="w-full max-w-sm rounded-2xl border border-slate-800 bg-slate-900 shadow-xl shadow-black/50 p-6 space-y-4">
+            <div class="flex items-center justify-between mb-3">
+                <div>
+                    <h2 class="text-sm font-semibold tracking-tight">Add Message Template</h2>
+                    <p class="text-[11px] text-slate-400">
+                        Create a notification template for specific events (SSL_EXPIRED, SITE_DOWN, etc.)
+                    </p>
+                </div>
+                <button
+                    id="add-template-close"
+                    class="text-slate-400 hover:text-slate-100 text-xs"
+                    aria-label="Close modal"
+                >
+                    ✕
+                </button>
+            </div>
+            <form id="add-template-form" class="space-y-3">
+                <div>
+                    <label class="block text-xs font-medium text-slate-300" for="template-event-name">
+                        Event Name
+                    </label>
+                    <input
+                        id="template-event-name"
+                        type="text"
+                        class="mt-1 w-full rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/70 focus:border-emerald-500/70"
+                        placeholder="SSL_EXPIRED"
+                        required
+                    />
+                    <p class="text-[11px] text-slate-500 mt-1">
+                        Examples: SSL_EXPIRED, SITE_DOWN, DOMAIN_EXPIRING
+                    </p>
+                </div>
+                <div>
+                    <label class="block text-xs font-medium text-slate-300" for="template-title">
+                        Title Template
+                    </label>
+                    <input
+                        id="template-title"
+                        type="text"
+                        class="mt-1 w-full rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/70 focus:border-emerald-500/70"
+                        placeholder="SSL Certificate Expired: {{domain}}"
+                        required
+                    />
+                </div>
+                <div>
+                    <label class="block text-xs font-medium text-slate-300" for="template-body">
+                        Body Template
+                    </label>
+                    <textarea
+                        id="template-body"
+                        rows="4"
+                        class="mt-1 w-full rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/70 focus:border-emerald-500/70"
+                        placeholder="The SSL certificate for {{domain}} expired on {{expiry_date}}"
+                        required
+                    ></textarea>
+                </div>
+                <p id="add-template-error" class="text-[11px] text-rose-400 min-h-[1.25rem]"></p>
+                <div class="flex items-center justify-end gap-2">
+                    <button
+                        type="button"
+                        id="add-template-cancel"
+                        class="rounded-lg border border-slate-700 px-3 py-1.5 text-[11px] text-slate-300 hover:bg-slate-800/80"
+                    >
+                        Cancel
+                    </button>
+                    <button
+                        type="submit"
+                        id="add-template-submit"
+                        class="inline-flex items-center gap-2 rounded-lg bg-emerald-500 px-3 py-1.5 text-[11px] font-medium text-slate-950 shadow-lg shadow-emerald-500/25 hover:bg-emerald-400 focus:outline-none focus:ring-2 focus:ring-emerald-500/70 disabled:opacity-60 disabled:cursor-not-allowed"
+                    >
+                        <span>Add Template</span>
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+
     <!-- Swagger UI Modal -->
     <div
         id="swagger-modal"
@@ -824,11 +1562,18 @@ func handleDashboard(c *gin.Context) {
     </div>
 
     <script src="https://unpkg.com/swagger-ui-dist/swagger-ui-bundle.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <script>
+        // Global error handler to prevent JS errors from blocking login
+        window.onerror = function(msg) {
+            console.log("Caught Error: " + msg);
+            return true;
+        };
+
         // Authentication helpers
         function getToken() {
             try {
-                return localStorage.getItem("zenstack_token") || "";
+                return localStorage.getItem("token") || "";
             } catch (_) {
                 return "";
             }
@@ -836,7 +1581,7 @@ func handleDashboard(c *gin.Context) {
 
         function getCurrentUser() {
             try {
-                const raw = localStorage.getItem("zenstack_user");
+                const raw = localStorage.getItem("user");
                 if (!raw) return null;
                 return JSON.parse(raw);
             } catch (_) {
@@ -846,15 +1591,15 @@ func handleDashboard(c *gin.Context) {
 
         function saveAuth(token, user) {
             try {
-                localStorage.setItem("zenstack_token", token || "");
-                localStorage.setItem("zenstack_user", JSON.stringify(user || {}));
+                localStorage.setItem("token", token || "");
+                localStorage.setItem("user", JSON.stringify(user || {}));
             } catch (_) {}
         }
 
         function clearAuth() {
             try {
-                localStorage.removeItem("zenstack_token");
-                localStorage.removeItem("zenstack_user");
+                localStorage.removeItem("token");
+                localStorage.removeItem("user");
             } catch (_) {}
         }
 
@@ -913,7 +1658,11 @@ func handleDashboard(c *gin.Context) {
             const infraForm = document.getElementById("infra-form");
             const infraSubmit = document.getElementById("infra-submit");
             const navUsers = document.getElementById("nav-users");
+            const navNotifications = document.getElementById("nav-notifications");
             const addUserBtn = document.getElementById("open-add-user");
+            const addNotificationConfigBtn = document.getElementById("open-add-notification-config");
+            const addTemplateBtn = document.getElementById("open-add-template");
+            const addTelegramConfigBtn = document.getElementById("open-add-telegram-config");
 
             if (!currentUserEl || !logoutBtn) return;
 
@@ -948,7 +1697,7 @@ func handleDashboard(c *gin.Context) {
             // Check localStorage directly for role as requested
             let storedRole = null;
             try {
-                const userData = localStorage.getItem("zenstack_user");
+                const userData = localStorage.getItem("user");
                 if (userData) {
                     const parsed = JSON.parse(userData);
                     storedRole = parsed ? parsed.role : null;
@@ -965,11 +1714,41 @@ func handleDashboard(c *gin.Context) {
                     navUsers.style.display = "none";
                 }
             }
+            if (navNotifications) {
+                if (isAdmin) {
+                    navNotifications.classList.remove("hidden");
+                    navNotifications.style.display = "";
+                } else {
+                    navNotifications.classList.add("hidden");
+                    navNotifications.style.display = "none";
+                }
+            }
             if (addUserBtn) {
                 if (role === "admin") {
                     addUserBtn.classList.remove("hidden");
                 } else {
                     addUserBtn.classList.add("hidden");
+                }
+            }
+            if (addNotificationConfigBtn) {
+                if (role === "admin") {
+                    addNotificationConfigBtn.classList.remove("hidden");
+                } else {
+                    addNotificationConfigBtn.classList.add("hidden");
+                }
+            }
+            if (addTemplateBtn) {
+                if (role === "admin") {
+                    addTemplateBtn.classList.remove("hidden");
+                } else {
+                    addTemplateBtn.classList.add("hidden");
+                }
+            }
+            if (addTelegramConfigBtn) {
+                if (role === "admin") {
+                    addTelegramConfigBtn.classList.remove("hidden");
+                } else {
+                    addTelegramConfigBtn.classList.add("hidden");
                 }
             }
         }
@@ -1005,9 +1784,547 @@ func handleDashboard(c *gin.Context) {
             }
         }
 
+        // Load and display monitored domains
+        async function loadDomains() {
+            const tbody = document.getElementById("domains-body");
+            if (!tbody) return;
+            try {
+                const resp = await apiFetch("/v1/domains", {
+                    method: "GET",
+                    headers: { "Accept": "application/json" },
+                });
+
+                if (!resp.ok) {
+                    throw new Error("Failed to load domains");
+                }
+
+                const domains = await resp.json();
+
+                if (!domains || domains.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="8" class="px-3 py-6 text-center text-xs text-slate-500">No domains in database. Run a scan to add domains.</td></tr>';
+                    return;
+                }
+
+                tbody.innerHTML = "";
+                for (const domain of domains) {
+                    const tr = document.createElement("tr");
+                    // Add pulse animation for Critical domains
+                    if (domain.ssl_status === "Critical") {
+                        tr.className = "hover:bg-slate-900/80 transition pulse-critical bg-red-500/10 border-l-4 border-red-500";
+                    } else {
+                        tr.className = "hover:bg-slate-900/80 transition";
+                    }
+
+                    // Domain name with live indicator
+                    const domainCell = document.createElement("td");
+                    domainCell.className = "px-3 py-2 text-xs font-medium text-slate-100";
+                    
+                    // Get isLive status and SSL status for this domain
+                    const isLive = domain.is_live || false;
+                    const sslStatus = domain.ssl_status || "";
+                    
+                    // Create status indicator dot (breathing/blinking light effect)
+                    const liveIndicator = document.createElement("span");
+                    liveIndicator.className = "live-indicator";
+                    
+                    // Determine status: Green (live & SSL safe), Yellow (live but SSL expiring), Red (down)
+                    if (!isLive) {
+                        // Site is down - blinking red
+                        liveIndicator.className += " down";
+                        liveIndicator.title = "Site is down";
+                    } else if (sslStatus === "Warning" || sslStatus === "Critical") {
+                        // Site is live but SSL is expiring - breathing yellow
+                        liveIndicator.className += " warning";
+                        liveIndicator.title = "Site is live but SSL is expiring";
+                    } else {
+                        // Site is live and SSL is safe - breathing green
+                        liveIndicator.className += " live";
+                        liveIndicator.title = "Site is live and SSL is safe";
+                    }
+                    domainCell.appendChild(liveIndicator);
+                    
+                    // Add domain name text
+                    const domainText = document.createTextNode(domain.domain_name || "-");
+                    domainCell.appendChild(domainText);
+
+                    // Live Status
+                    const liveStatusCell = document.createElement("td");
+                    liveStatusCell.className = "px-3 py-2 text-xs";
+                    const statusCode = domain.status_code || 0;
+                    const liveStatusIndicator = document.createElement("div");
+                    liveStatusIndicator.className = "flex items-center gap-1.5";
+                    const liveDot = document.createElement("span");
+                    if (isLive && statusCode === 200) {
+                        liveDot.className = "h-2 w-2 rounded-full bg-emerald-400";
+                        liveStatusIndicator.appendChild(liveDot);
+                        const liveText = document.createElement("span");
+                        liveText.className = "text-emerald-300 text-[10px]";
+                        liveText.textContent = "Live";
+                        liveStatusIndicator.appendChild(liveText);
+                    } else {
+                        liveDot.className = "h-2 w-2 rounded-full bg-red-400";
+                        liveStatusIndicator.appendChild(liveDot);
+                        const liveText = document.createElement("span");
+                        liveText.className = "text-red-300 text-[10px]";
+                        if (statusCode > 0) {
+                            liveText.textContent = statusCode;
+                        } else {
+                            liveText.textContent = "Down";
+                        }
+                        liveStatusIndicator.appendChild(liveText);
+                    }
+                    liveStatusCell.appendChild(liveStatusIndicator);
+
+                    // SSL Status
+                    const sslStatusCell = document.createElement("td");
+                    sslStatusCell.className = "px-3 py-2 text-xs";
+                    const currentSSLStatus = domain.ssl_status || "Unknown";
+                    const sslBadge = document.createElement("span");
+                    sslBadge.className = statusBadgeClasses(currentSSLStatus);
+                    sslBadge.textContent = currentSSLStatus;
+                    sslStatusCell.appendChild(sslBadge);
+
+                    // SSL Expiry
+                    const sslExpiryCell = document.createElement("td");
+                    sslExpiryCell.className = "px-3 py-2 text-xs text-slate-200";
+                    if (domain.ssl_expiry) {
+                        const dt = new Date(domain.ssl_expiry);
+                        sslExpiryCell.textContent = dt.toLocaleString();
+                    } else {
+                        sslExpiryCell.textContent = "-";
+                    }
+
+                    // Days Remaining
+                    const daysCell = document.createElement("td");
+                    daysCell.className = "px-3 py-2 text-xs text-slate-200";
+                    if (domain.ssl_expiry) {
+                        const expiry = new Date(domain.ssl_expiry);
+                        const now = new Date();
+                        const diffMs = expiry.getTime() - now.getTime();
+                        const diffDays = Math.ceil(diffMs / (1000 * 60 * 60 * 24));
+                        daysCell.textContent = diffDays >= 0 ? diffDays : "Expired";
+                        // Color code based on days
+                        if (diffDays < 7) {
+                            daysCell.className = "px-3 py-2 text-xs text-red-400 font-medium";
+                        } else if (diffDays < 15) {
+                            daysCell.className = "px-3 py-2 text-xs text-amber-400 font-medium";
+                        }
+                    } else {
+                        daysCell.textContent = "-";
+                    }
+
+                    // Last Check Time
+                    const lastCheckCell = document.createElement("td");
+                    lastCheckCell.className = "px-3 py-2 text-xs text-slate-300";
+                    if (domain.last_check_time) {
+                        const dt = new Date(domain.last_check_time);
+                        lastCheckCell.textContent = dt.toLocaleString();
+                    } else {
+                        lastCheckCell.textContent = "Never";
+                    }
+
+                    // Auto-Renew Toggle
+                    const autoRenewCell = document.createElement("td");
+                    autoRenewCell.className = "px-3 py-2 text-xs";
+                    const toggle = document.createElement("label");
+                    toggle.className = "relative inline-flex items-center cursor-pointer";
+                    const checkbox = document.createElement("input");
+                    checkbox.type = "checkbox";
+                    checkbox.className = "sr-only peer";
+                    checkbox.checked = domain.auto_renew || false;
+                    checkbox.addEventListener("change", async function() {
+                        try {
+                            const resp = await apiFetch("/v1/domains/" + domain.id + "/auto-renew", {
+                                method: "PUT",
+                                headers: {
+                                    "Content-Type": "application/json",
+                                    "Accept": "application/json",
+                                },
+                                body: JSON.stringify({ auto_renew: checkbox.checked }),
+                            });
+                            if (!resp.ok) {
+                                checkbox.checked = !checkbox.checked;
+                                alert("Failed to update auto-renew setting");
+                            }
+                        } catch (err) {
+                            checkbox.checked = !checkbox.checked;
+                            alert("Error updating auto-renew: " + err.message);
+                        }
+                    });
+                    const slider = document.createElement("div");
+                    slider.className = "w-11 h-6 bg-slate-700 peer-focus:outline-none peer-focus:ring-2 peer-focus:ring-emerald-500/70 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-emerald-500";
+                    toggle.appendChild(checkbox);
+                    toggle.appendChild(slider);
+                    autoRenewCell.appendChild(toggle);
+
+                    // Actions
+                    const actionsCell = document.createElement("td");
+                    actionsCell.className = "px-3 py-2 text-xs";
+                    const renewBtn = document.createElement("button");
+                    renewBtn.className = "inline-flex items-center gap-1 rounded-lg border border-slate-700 px-2 py-1 text-[10px] text-slate-200 hover:bg-slate-800/80";
+                    renewBtn.textContent = "Renew";
+                    renewBtn.addEventListener("click", async function() {
+                        if (!confirm("Manually renew domain " + domain.domain_name + "?")) return;
+                        try {
+                            const resp = await apiFetch("/v1/domains/" + domain.id + "/renew", {
+                                method: "POST",
+                                headers: { "Accept": "application/json" },
+                            });
+                            const data = await resp.json();
+                            alert(data.message || "Renewal initiated");
+                        } catch (err) {
+                            alert("Error initiating renewal: " + err.message);
+                        }
+                    });
+                    actionsCell.appendChild(renewBtn);
+
+                    tr.appendChild(domainCell);
+                    tr.appendChild(liveStatusCell);
+                    tr.appendChild(sslStatusCell);
+                    tr.appendChild(sslExpiryCell);
+                    tr.appendChild(daysCell);
+                    tr.appendChild(lastCheckCell);
+                    tr.appendChild(autoRenewCell);
+                    tr.appendChild(actionsCell);
+
+                    tbody.appendChild(tr);
+                }
+            } catch (err) {
+                console.error("Error loading domains:", err);
+                tbody.innerHTML = '<tr><td colspan="8" class="px-3 py-6 text-center text-xs text-red-400">Error loading domains: ' + (err.message || "Unknown error") + "</td></tr>";
+            }
+        }
+
+        // Load and display notification configurations
+        async function loadNotificationConfigs() {
+            const tbody = document.getElementById("notification-configs-body");
+            if (!tbody) return;
+            try {
+                const resp = await apiFetch("/v1/admin/notifications/configs", {
+                    method: "GET",
+                    headers: { "Accept": "application/json" },
+                });
+
+                if (!resp.ok) {
+                    throw new Error("Failed to load notification configs");
+                }
+
+                const data = await resp.json();
+                const configs = data.configs || [];
+
+                if (configs.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="4" class="px-3 py-6 text-center text-xs text-slate-500">No notification configurations. Add one to get started.</td></tr>';
+                    return;
+                }
+
+                tbody.innerHTML = "";
+                for (const config of configs) {
+                    const tr = document.createElement("tr");
+                    tr.className = "hover:bg-slate-900/80 transition";
+
+                    // Platform
+                    const platformCell = document.createElement("td");
+                    platformCell.className = "px-3 py-2 text-xs font-medium text-slate-100";
+                    platformCell.textContent = config.platform || "-";
+
+                    // Webhook URL (truncated)
+                    const urlCell = document.createElement("td");
+                    urlCell.className = "px-3 py-2 text-xs text-slate-300";
+                    const url = config.webhook_url || "-";
+                    urlCell.textContent = url.length > 50 ? url.substring(0, 50) + "..." : url;
+
+                    // Status
+                    const statusCell = document.createElement("td");
+                    statusCell.className = "px-3 py-2 text-xs";
+                    const statusBadge = document.createElement("span");
+                    if (config.is_active) {
+                        statusBadge.className = "inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-300 border border-emerald-500/40";
+                        statusBadge.textContent = "Active";
+                    } else {
+                        statusBadge.className = "inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-slate-700/60 text-slate-300 border border-slate-600/60";
+                        statusBadge.textContent = "Inactive";
+                    }
+                    statusCell.appendChild(statusBadge);
+
+                    // Actions
+                    const actionsCell = document.createElement("td");
+                    actionsCell.className = "px-3 py-2 text-xs";
+                    const deleteBtn = document.createElement("button");
+                    deleteBtn.className = "inline-flex items-center gap-1 rounded-lg border border-slate-700 px-2 py-1 text-[10px] text-rose-300 hover:bg-rose-500/10";
+                    deleteBtn.textContent = "Delete";
+                    deleteBtn.addEventListener("click", async function() {
+                        if (!confirm("Delete this notification configuration?")) return;
+                        try {
+                            const resp = await apiFetch("/v1/admin/notifications/configs/" + config.id, {
+                                method: "DELETE",
+                                headers: { "Accept": "application/json" },
+                            });
+                            if (resp.ok) {
+                                loadNotificationConfigs();
+                            } else {
+                                alert("Failed to delete configuration");
+                            }
+                        } catch (err) {
+                            alert("Error deleting configuration: " + err.message);
+                        }
+                    });
+                    actionsCell.appendChild(deleteBtn);
+
+                    tr.appendChild(platformCell);
+                    tr.appendChild(urlCell);
+                    tr.appendChild(statusCell);
+                    tr.appendChild(actionsCell);
+
+                    tbody.appendChild(tr);
+                }
+            } catch (err) {
+                console.error("Error loading notification configs:", err);
+                tbody.innerHTML = '<tr><td colspan="4" class="px-3 py-6 text-center text-xs text-red-400">Error loading configs: ' + (err.message || "Unknown error") + "</td></tr>";
+            }
+        }
+
+        // Load and display message templates
+        async function loadMessageTemplates() {
+            const tbody = document.getElementById("message-templates-body");
+            if (!tbody) return;
+            try {
+                const resp = await apiFetch("/v1/admin/notifications/templates", {
+                    method: "GET",
+                    headers: { "Accept": "application/json" },
+                });
+
+                if (!resp.ok) {
+                    throw new Error("Failed to load message templates");
+                }
+
+                const data = await resp.json();
+                const templates = data.templates || [];
+
+                if (templates.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="4" class="px-3 py-6 text-center text-xs text-slate-500">No message templates. Add one to get started.</td></tr>';
+                    return;
+                }
+
+                tbody.innerHTML = "";
+                for (const template of templates) {
+                    const tr = document.createElement("tr");
+                    tr.className = "hover:bg-slate-900/80 transition";
+
+                    // Event Name
+                    const eventCell = document.createElement("td");
+                    eventCell.className = "px-3 py-2 text-xs font-medium text-slate-100";
+                    eventCell.textContent = template.event_name || "-";
+
+                    // Title Template (truncated)
+                    const titleCell = document.createElement("td");
+                    titleCell.className = "px-3 py-2 text-xs text-slate-300";
+                    const title = template.title_template || "-";
+                    titleCell.textContent = title.length > 40 ? title.substring(0, 40) + "..." : title;
+
+                    // Body Template (truncated)
+                    const bodyCell = document.createElement("td");
+                    bodyCell.className = "px-3 py-2 text-xs text-slate-300";
+                    const body = template.body_template || "-";
+                    bodyCell.textContent = body.length > 40 ? body.substring(0, 40) + "..." : body;
+
+                    // Actions
+                    const actionsCell = document.createElement("td");
+                    actionsCell.className = "px-3 py-2 text-xs";
+                    const deleteBtn = document.createElement("button");
+                    deleteBtn.className = "inline-flex items-center gap-1 rounded-lg border border-slate-700 px-2 py-1 text-[10px] text-rose-300 hover:bg-rose-500/10";
+                    deleteBtn.textContent = "Delete";
+                    deleteBtn.addEventListener("click", async function() {
+                        if (!confirm("Delete this message template?")) return;
+                        try {
+                            const resp = await apiFetch("/v1/admin/notifications/templates/" + template.id, {
+                                method: "DELETE",
+                                headers: { "Accept": "application/json" },
+                            });
+                            if (resp.ok) {
+                                loadMessageTemplates();
+                            } else {
+                                alert("Failed to delete template");
+                            }
+                        } catch (err) {
+                            alert("Error deleting template: " + err.message);
+                        }
+                    });
+                    actionsCell.appendChild(deleteBtn);
+
+                    tr.appendChild(eventCell);
+                    tr.appendChild(titleCell);
+                    tr.appendChild(bodyCell);
+                    tr.appendChild(actionsCell);
+
+                    tbody.appendChild(tr);
+                }
+            } catch (err) {
+                console.error("Error loading message templates:", err);
+                tbody.innerHTML = '<tr><td colspan="4" class="px-3 py-6 text-center text-xs text-red-400">Error loading templates: ' + (err.message || "Unknown error") + "</td></tr>";
+            }
+        }
+
+        // Load and display Telegram configurations
+        async function loadTelegramConfigs() {
+            const tbody = document.getElementById("telegram-configs-body");
+            if (!tbody) return;
+            try {
+                const resp = await apiFetch("/v1/admin/notifications/telegram", {
+                    method: "GET",
+                    headers: { "Accept": "application/json" },
+                });
+
+                if (!resp.ok) {
+                    throw new Error("Failed to load Telegram configs");
+                }
+
+                const data = await resp.json();
+                const configs = data.configs || [];
+
+                if (configs.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="3" class="px-3 py-6 text-center text-xs text-slate-500">No Telegram configurations. Add one to get started.</td></tr>';
+                    return;
+                }
+
+                tbody.innerHTML = "";
+                for (const config of configs) {
+                    const tr = document.createElement("tr");
+                    tr.className = "hover:bg-slate-900/80 transition";
+
+                    // Chat ID
+                    const chatIdCell = document.createElement("td");
+                    chatIdCell.className = "px-3 py-2 text-xs font-medium text-slate-100";
+                    chatIdCell.textContent = config.tg_chat_id || "-";
+
+                    // Status
+                    const statusCell = document.createElement("td");
+                    statusCell.className = "px-3 py-2 text-xs";
+                    const statusBadge = document.createElement("span");
+                    if (config.is_active) {
+                        statusBadge.className = "inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-300 border border-emerald-500/40";
+                        statusBadge.textContent = "Active";
+                    } else {
+                        statusBadge.className = "inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-slate-700/60 text-slate-300 border border-slate-600/60";
+                        statusBadge.textContent = "Inactive";
+                    }
+                    statusCell.appendChild(statusBadge);
+
+                    // Actions
+                    const actionsCell = document.createElement("td");
+                    actionsCell.className = "px-3 py-2 text-xs flex items-center gap-2";
+                    
+                    // Test Connection button
+                    const testBtn = document.createElement("button");
+                    testBtn.className = "inline-flex items-center gap-1 rounded-lg border border-slate-700 px-2 py-1 text-[10px] text-sky-300 hover:bg-sky-500/10";
+                    testBtn.textContent = "Test";
+                    testBtn.addEventListener("click", async function() {
+                        testBtn.disabled = true;
+                        testBtn.textContent = "Testing...";
+                        try {
+                            const resp = await apiFetch("/v1/admin/notifications/telegram/" + config.id + "/test", {
+                                method: "POST",
+                                headers: { "Accept": "application/json" },
+                            });
+                            if (resp.ok) {
+                                alert("Test message sent successfully! Check your Telegram.");
+                            } else {
+                                const data = await resp.json();
+                                alert("Failed to send test message: " + (data.error || data.details || "Unknown error"));
+                            }
+                        } catch (err) {
+                            alert("Error testing connection: " + err.message);
+                        } finally {
+                            testBtn.disabled = false;
+                            testBtn.textContent = "Test";
+                        }
+                    });
+                    actionsCell.appendChild(testBtn);
+                    
+                    // Delete button
+                    const deleteBtn = document.createElement("button");
+                    deleteBtn.className = "inline-flex items-center gap-1 rounded-lg border border-slate-700 px-2 py-1 text-[10px] text-rose-300 hover:bg-rose-500/10";
+                    deleteBtn.textContent = "Delete";
+                    deleteBtn.addEventListener("click", async function() {
+                        if (!confirm("Delete this Telegram configuration?")) return;
+                        try {
+                            const resp = await apiFetch("/v1/admin/notifications/telegram/" + config.id, {
+                                method: "DELETE",
+                                headers: { "Accept": "application/json" },
+                            });
+                            if (resp.ok) {
+                                loadTelegramConfigs();
+                            } else {
+                                alert("Failed to delete configuration");
+                            }
+                        } catch (err) {
+                            alert("Error deleting configuration: " + err.message);
+                        }
+                    });
+                    actionsCell.appendChild(deleteBtn);
+
+                    tr.appendChild(chatIdCell);
+                    tr.appendChild(statusCell);
+                    tr.appendChild(actionsCell);
+
+                    tbody.appendChild(tr);
+                }
+            } catch (err) {
+                console.error("Error loading Telegram configs:", err);
+                tbody.innerHTML = '<tr><td colspan="3" class="px-3 py-6 text-center text-xs text-red-400">Error loading configs: ' + (err.message || "Unknown error") + "</td></tr>";
+            }
+        }
+
+        // Load template editors with current template content
+        async function loadTemplateEditors() {
+            try {
+                const resp = await apiFetch("/v1/admin/notifications/templates", {
+                    method: "GET",
+                    headers: { "Accept": "application/json" },
+                });
+
+                if (!resp.ok) {
+                    throw new Error("Failed to load templates");
+                }
+
+                const data = await resp.json();
+                const templates = data.templates || [];
+
+                // Find SiteDown template
+                const siteDownTemplate = templates.find(t => t.name === "SiteDown" || t.event_name === "SITE_DOWN");
+                if (siteDownTemplate) {
+                    const textarea = document.getElementById("sitedown-template-text");
+                    if (textarea) {
+                        textarea.value = siteDownTemplate.template_text || siteDownTemplate.body_template || "";
+                        textarea.dataset.templateId = siteDownTemplate.id;
+                    }
+                }
+
+                // Find SSLExpired template
+                const sslExpiredTemplate = templates.find(t => t.name === "SSLExpired" || t.event_name === "SSL_CRITICAL");
+                if (sslExpiredTemplate) {
+                    const textarea = document.getElementById("sslexpired-template-text");
+                    if (textarea) {
+                        textarea.value = sslExpiredTemplate.template_text || sslExpiredTemplate.body_template || "";
+                        textarea.dataset.templateId = sslExpiredTemplate.id;
+                    }
+                }
+            } catch (err) {
+                console.error("Error loading template editors:", err);
+            }
+        }
+
         // View switching for sidebar navigation
+        // showSection is an alias for setActiveView for compatibility
+        function showSection(view) {
+            // Map 'settings' to 'notifications' if needed
+            if (view === 'settings') {
+                view = 'notifications';
+            }
+            setActiveView(view);
+        }
+
         function setActiveView(view) {
-            const views = ["assets", "catalog", "infra", "users"];
+            const views = ["dashboard", "assets", "catalog", "infra", "users", "notifications"];
             
             // Hide all sections first
             for (const v of views) {
@@ -1019,6 +2336,7 @@ func handleDashboard(c *gin.Context) {
                 }
                 if (btn) {
                     btn.classList.remove("bg-slate-800", "text-slate-50", "font-medium");
+                    btn.classList.add("text-slate-300");
                 }
             }
             
@@ -1031,16 +2349,30 @@ func handleDashboard(c *gin.Context) {
             }
             if (selectedBtn) {
                 selectedBtn.classList.add("bg-slate-800", "text-slate-50", "font-medium");
+                selectedBtn.classList.remove("text-slate-300");
             }
             
             // Auto-load data when switching to specific views
-            if (view === "users") {
+            if (view === "dashboard") {
+                loadDashboardStats();
+            } else if (view === "assets") {
+                loadDomains();
+            } else if (view === "users") {
                 const userSection = document.getElementById("user-management-section");
                 if (userSection) {
                     userSection.classList.remove("hidden");
                     userSection.style.display = "";
                 }
                 loadUsers();
+            } else if (view === "notifications") {
+                loadNotificationConfigs();
+                loadMessageTemplates();
+                loadTelegramConfigs();
+                loadTemplateEditors();
+                // Initialize admin features when notifications view is shown
+                if (typeof initAdminFeatures === 'function') {
+                    initAdminFeatures();
+                }
             } else {
                 const userSection = document.getElementById("user-management-section");
                 if (userSection) {
@@ -1083,11 +2415,11 @@ func handleDashboard(c *gin.Context) {
             label.textContent = "Scanning...";
 
             try {
-                const resp = await fetch("/v1/scan?" + params.toString(), {
+                const resp = await apiFetch("/v1/scan?" + params.toString(), {
                     method: "GET",
-                    headers: authHeaders({
+                    headers: {
                         "Accept": "application/json",
-                    }),
+                    },
                 });
 
                 if (!resp.ok) {
@@ -1247,12 +2579,12 @@ func handleDashboard(c *gin.Context) {
             spinner.classList.remove("hidden");
 
             try {
-                const resp = await fetch("/v1/projects", {
+                const resp = await apiFetch("/v1/projects", {
                     method: "POST",
-                    headers: authHeaders({
+                    headers: {
                         "Content-Type": "application/json",
                         "Accept": "application/json",
-                    }),
+                    },
                     body: JSON.stringify({
                         project_name: projectName,
                         description: "Service created from ZenStack catalog",
@@ -1288,9 +2620,9 @@ func handleDashboard(c *gin.Context) {
             const list = document.getElementById("infra-size-list");
             if (!list) return;
             try {
-                const resp = await fetch("/v1/infra/options", {
+                const resp = await apiFetch("/v1/infra/options", {
                     method: "GET",
-                    headers: authHeaders({ "Accept": "application/json" }),
+                    headers: { "Accept": "application/json" },
                 });
                 if (!resp.ok) {
                     throw new Error("Failed to load infra options (status " + resp.status + ")");
@@ -1332,12 +2664,12 @@ func handleDashboard(c *gin.Context) {
             button.disabled = true;
 
             try {
-                const resp = await fetch("/v1/infra/provision", {
+                const resp = await apiFetch("/v1/infra/provision", {
                     method: "POST",
-                    headers: authHeaders({
+                    headers: {
                         "Content-Type": "application/json",
                         "Accept": "application/json",
-                    }),
+                    },
                     body: JSON.stringify({
                         name,
                         engine,
@@ -1374,9 +2706,9 @@ func handleDashboard(c *gin.Context) {
             const tbody = document.getElementById("projects-body");
             if (!tbody) return;
             try {
-                const resp = await fetch("/v1/projects", {
+                const resp = await apiFetch("/v1/projects", {
                     method: "GET",
-                    headers: authHeaders({ "Accept": "application/json" }),
+                    headers: { "Accept": "application/json" },
                 });
                 const data = await resp.json().catch(() => ({}));
                 if (!resp.ok) {
@@ -1439,9 +2771,9 @@ func handleDashboard(c *gin.Context) {
             const tbody = document.getElementById("infra-body");
             if (!tbody) return;
             try {
-                const resp = await fetch("/v1/infra", {
+                const resp = await apiFetch("/v1/infra", {
                     method: "GET",
-                    headers: authHeaders({ "Accept": "application/json" }),
+                    headers: { "Accept": "application/json" },
                 });
                 const data = await resp.json().catch(() => ({}));
                 if (!resp.ok) {
@@ -1629,9 +2961,9 @@ func handleDashboard(c *gin.Context) {
             const lastStatus = document.getElementById("infra-last-status");
             if (!projectName) return;
             try {
-                const resp = await fetch("/v1/infra/status?project=" + encodeURIComponent(projectName), {
+                const resp = await apiFetch("/v1/infra/status?project=" + encodeURIComponent(projectName), {
                     method: "GET",
-                    headers: authHeaders({ "Accept": "application/json" }),
+                    headers: { "Accept": "application/json" },
                 });
                 const data = await resp.json().catch(() => ({}));
                 if (!resp.ok) {
@@ -1666,18 +2998,215 @@ func handleDashboard(c *gin.Context) {
             }, 5000);
         }
 
+        // Dashboard charts
+        let domainSuffixChart = null;
+        let monthlyExpiryChart = null;
+
+        // Load dashboard statistics and render charts
+        async function loadDashboardStats() {
+            try {
+                const resp = await apiFetch("/v1/dashboard/stats", {
+                    method: "GET",
+                    headers: { "Accept": "application/json" },
+                });
+
+                if (!resp.ok) {
+                    console.error("Failed to load dashboard stats:", resp.status);
+                    return;
+                }
+
+                const stats = await resp.json();
+
+                // Update statistic cards
+                const totalDomainsEl = document.getElementById("stat-total-domains");
+                const sslCriticalEl = document.getElementById("stat-ssl-critical");
+                const sslWarningEl = document.getElementById("stat-ssl-warning");
+                const projectCountEl = document.getElementById("stat-project-count");
+                const globalAvailabilityEl = document.getElementById("stat-global-availability");
+                const sitesDownEl = document.getElementById("stat-sites-down");
+
+                if (totalDomainsEl) totalDomainsEl.textContent = stats.total_domains || stats.totalDomains || 0;
+                if (sslCriticalEl) sslCriticalEl.textContent = stats.sslCritical || 0;
+                if (sslWarningEl) sslWarningEl.textContent = stats.sslWarning || 0;
+                if (projectCountEl) projectCountEl.textContent = stats.project_count || 0;
+                if (sitesDownEl) sitesDownEl.textContent = stats.sites_down || 0;
+                
+                // Display global availability as percentage
+                if (globalAvailabilityEl) {
+                    const availability = stats.global_availability || 0;
+                    globalAvailabilityEl.textContent = availability.toFixed(1) + "%";
+                    // Color code based on availability
+                    if (availability >= 99) {
+                        globalAvailabilityEl.className = "text-3xl font-bold text-emerald-400";
+                    } else if (availability >= 95) {
+                        globalAvailabilityEl.className = "text-3xl font-bold text-amber-400";
+                    } else {
+                        globalAvailabilityEl.className = "text-3xl font-bold text-red-400";
+                    }
+                }
+
+                // Render charts with data from API
+                if (stats.suffix_distribution) {
+                    renderDomainSuffixChart(stats.suffix_distribution);
+                }
+                if (stats.monthly_expiry) {
+                    renderMonthlyExpiryChart(stats.monthly_expiry);
+                }
+            } catch (err) {
+                console.error("Error loading dashboard stats:", err);
+            }
+        }
+
+        // Render domain suffix distribution doughnut chart
+        function renderDomainSuffixChart(suffixDistribution) {
+            const ctx = document.getElementById("project-types-chart");
+            if (!ctx) return;
+
+            // Sort suffixes by count (descending) and take top 8
+            const entries = Object.entries(suffixDistribution);
+            entries.sort((a, b) => b[1] - a[1]);
+            const topSuffixes = entries.slice(0, 8);
+            
+            const labels = topSuffixes.map(([suffix]) => suffix || "other");
+            const data = topSuffixes.map(([, count]) => count);
+            
+            const colors = [
+                "rgba(16, 185, 129, 0.8)",  // emerald
+                "rgba(59, 130, 246, 0.8)",  // sky
+                "rgba(251, 191, 36, 0.8)",  // amber
+                "rgba(168, 85, 247, 0.8)",  // purple
+                "rgba(236, 72, 153, 0.8)",  // pink
+                "rgba(34, 197, 94, 0.8)",   // green
+                "rgba(249, 115, 22, 0.8)",  // orange
+                "rgba(139, 92, 246, 0.8)",  // violet
+            ];
+
+            if (domainSuffixChart) {
+                domainSuffixChart.destroy();
+            }
+
+            domainSuffixChart = new Chart(ctx, {
+                type: "doughnut",
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        data: data,
+                        backgroundColor: colors.slice(0, labels.length),
+                        borderColor: "rgba(15, 23, 42, 0.8)",
+                        borderWidth: 2,
+                    }],
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            position: "bottom",
+                            labels: {
+                                color: "rgb(148, 163, 184)",
+                                font: { size: 11 },
+                            },
+                        },
+                    },
+                },
+            });
+        }
+
+        // Render monthly expiring domains bar chart
+        function renderMonthlyExpiryChart(monthlyExpiry) {
+            const ctx = document.getElementById("domain-status-chart");
+            if (!ctx) return;
+
+            // Sort months chronologically
+            const entries = Object.entries(monthlyExpiry);
+            entries.sort((a, b) => a[0].localeCompare(b[0]));
+            
+            // Format month labels (e.g., "2024-01" -> "Jan 2024")
+            const labels = entries.map(([monthKey]) => {
+                const [year, month] = monthKey.split("-");
+                const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", 
+                                   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+                return monthNames[parseInt(month) - 1] + " " + year;
+            });
+            const data = entries.map(([, count]) => count);
+
+            if (monthlyExpiryChart) {
+                monthlyExpiryChart.destroy();
+            }
+
+            monthlyExpiryChart = new Chart(ctx, {
+                type: "bar",
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: "Expiring Domains",
+                        data: data,
+                        backgroundColor: "rgba(251, 191, 36, 0.8)",  // amber
+                        borderColor: "rgba(251, 191, 36, 1)",
+                        borderWidth: 1,
+                    }],
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            display: false,
+                        },
+                    },
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            ticks: {
+                                color: "rgb(148, 163, 184)",
+                                font: { size: 11 },
+                                stepSize: 1,
+                            },
+                            grid: {
+                                color: "rgba(51, 65, 85, 0.3)",
+                            },
+                        },
+                        x: {
+                            ticks: {
+                                color: "rgb(148, 163, 184)",
+                                font: { size: 11 },
+                            },
+                            grid: {
+                                color: "rgba(51, 65, 85, 0.3)",
+                            },
+                        },
+                    },
+                },
+            });
+        }
+
         // Wire up event listeners once the DOM is ready
         document.addEventListener("DOMContentLoaded", function () {
             // Sidebar view switching
-            document.getElementById("nav-assets").addEventListener("click", function () {
-                setActiveView("assets");
-            });
-            document.getElementById("nav-catalog").addEventListener("click", function () {
-                setActiveView("catalog");
-            });
-            document.getElementById("nav-infra").addEventListener("click", function () {
-                setActiveView("infra");
-            });
+            const navDashboard = document.getElementById("nav-dashboard");
+            if (navDashboard) {
+                navDashboard.addEventListener("click", function () {
+                    setActiveView("dashboard");
+                });
+            }
+            const navAssets = document.getElementById("nav-assets");
+            if (navAssets) {
+                navAssets.addEventListener("click", function () {
+                    setActiveView("assets");
+                });
+            }
+            const navCatalog = document.getElementById("nav-catalog");
+            if (navCatalog) {
+                navCatalog.addEventListener("click", function () {
+                    setActiveView("catalog");
+                });
+            }
+            const navInfra = document.getElementById("nav-infra");
+            if (navInfra) {
+                navInfra.addEventListener("click", function () {
+                    setActiveView("infra");
+                });
+            }
             const navUsersBtn = document.getElementById("nav-users");
             if (navUsersBtn) {
                 navUsersBtn.addEventListener("click", function () {
@@ -1685,19 +3214,38 @@ func handleDashboard(c *gin.Context) {
                 });
             }
 
-            // Default view
-            setActiveView("assets");
+            const navNotificationsBtn = document.getElementById("nav-notifications");
+            if (navNotificationsBtn) {
+                navNotificationsBtn.addEventListener("click", function () {
+                    setActiveView("notifications");
+                });
+            }
+
+            // Default view - Dashboard
+            if (typeof setActiveView === 'function') {
+                setActiveView("dashboard");
+            }
 
             // Scanner actions
-            document.getElementById("scan-button").addEventListener("click", function () {
-                runScan();
-            });
-            document.getElementById("domains-input").addEventListener("keydown", function (event) {
-                if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
-                    event.preventDefault();
-                    runScan();
-                }
-            });
+            const scanButton = document.getElementById("scan-button");
+            if (scanButton) {
+                scanButton.addEventListener("click", function () {
+                    if (typeof runScan === 'function') {
+                        runScan();
+                    }
+                });
+            }
+            const domainsInput = document.getElementById("domains-input");
+            if (domainsInput) {
+                domainsInput.addEventListener("keydown", function (event) {
+                    if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+                        event.preventDefault();
+                        if (typeof runScan === 'function') {
+                            runScan();
+                        }
+                    }
+                });
+            }
 
             // Create Service modal events
             const openBtn = document.getElementById("open-create-service");
@@ -1724,6 +3272,14 @@ func handleDashboard(c *gin.Context) {
             if (svcForm) {
                 svcForm.addEventListener("submit", submitCreateService);
             }
+
+        // Initialize admin features - only called when notifications view is shown
+        function initAdminFeatures() {
+            // Prevent duplicate initialization
+            if (window.adminFeaturesInitialized) {
+                return;
+            }
+            window.adminFeaturesInitialized = true;
 
             // Add User modal events
             const openAddUserBtn = document.getElementById("open-add-user");
@@ -1814,6 +3370,565 @@ func handleDashboard(c *gin.Context) {
                 });
             }
 
+            // Notification Config Modal Events
+            const openNotificationConfigBtn = document.getElementById("open-add-notification-config");
+            if (openNotificationConfigBtn) {
+                openNotificationConfigBtn.addEventListener("click", function () {
+                    const modal = document.getElementById("add-notification-config-modal");
+                    if (modal) {
+                        modal.classList.remove("hidden");
+                        modal.classList.add("flex");
+                    }
+                });
+            }
+            const closeNotificationConfigBtn = document.getElementById("add-notification-config-close");
+            if (closeNotificationConfigBtn) {
+                closeNotificationConfigBtn.addEventListener("click", function () {
+                    const modal = document.getElementById("add-notification-config-modal");
+                    if (modal) {
+                        modal.classList.add("hidden");
+                        modal.classList.remove("flex");
+                    }
+                    const errorEl = document.getElementById("add-notification-config-error");
+                    if (errorEl) errorEl.textContent = "";
+                    const form = document.getElementById("add-notification-config-form");
+                    if (form) form.reset();
+                });
+            }
+            const cancelNotificationConfigBtn = document.getElementById("add-notification-config-cancel");
+            if (cancelNotificationConfigBtn) {
+                cancelNotificationConfigBtn.addEventListener("click", function () {
+                    const modal = document.getElementById("add-notification-config-modal");
+                    if (modal) {
+                        modal.classList.add("hidden");
+                        modal.classList.remove("flex");
+                    }
+                    const errorEl = document.getElementById("add-notification-config-error");
+                    if (errorEl) errorEl.textContent = "";
+                    const form = document.getElementById("add-notification-config-form");
+                    if (form) form.reset();
+                });
+            }
+            const addNotificationConfigForm = document.getElementById("add-notification-config-form");
+            if (addNotificationConfigForm) {
+                addNotificationConfigForm.addEventListener("submit", async function (event) {
+                    event.preventDefault();
+                    const platform = (document.getElementById("config-platform").value || "").trim();
+                    const webhookURL = (document.getElementById("config-webhook-url").value || "").trim();
+                    const secretKey = (document.getElementById("config-secret-key").value || "").trim();
+                    const isActive = document.getElementById("config-is-active").checked;
+                    const errorEl = document.getElementById("add-notification-config-error");
+                    const submitBtn = document.getElementById("add-notification-config-submit");
+
+                    errorEl.textContent = "";
+                    if (!platform || !webhookURL) {
+                        errorEl.textContent = "Platform and Webhook URL are required.";
+                        return;
+                    }
+
+                    submitBtn.disabled = true;
+                    submitBtn.textContent = "Adding...";
+
+                    try {
+                        const resp = await apiFetch("/v1/admin/notifications/configs", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({
+                                platform: platform,
+                                webhook_url: webhookURL,
+                                secret_key: secretKey,
+                                is_active: isActive,
+                            }),
+                        });
+
+                        if (!resp.ok) {
+                            const data = await resp.json();
+                            throw new Error(data.error || "Failed to create notification config");
+                        }
+
+                        const modal = document.getElementById("add-notification-config-modal");
+                        if (modal) {
+                            modal.classList.add("hidden");
+                            modal.classList.remove("flex");
+                        }
+                        const form = document.getElementById("add-notification-config-form");
+                        if (form) form.reset();
+                        loadNotificationConfigs();
+                    } catch (err) {
+                        console.error(err);
+                        errorEl.textContent = err.message || "Unexpected error while creating notification config.";
+                    } finally {
+                        submitBtn.disabled = false;
+                        submitBtn.textContent = "Add Config";
+                    }
+                });
+            }
+
+            // Message Template Modal Events
+            const openTemplateBtn = document.getElementById("open-add-template");
+            if (openTemplateBtn) {
+                openTemplateBtn.addEventListener("click", function () {
+                    const modal = document.getElementById("add-template-modal");
+                    if (modal) {
+                        modal.classList.remove("hidden");
+                        modal.classList.add("flex");
+                    }
+                });
+            }
+            const closeTemplateBtn = document.getElementById("add-template-close");
+            if (closeTemplateBtn) {
+                closeTemplateBtn.addEventListener("click", function () {
+                    const modal = document.getElementById("add-template-modal");
+                    if (modal) {
+                        modal.classList.add("hidden");
+                        modal.classList.remove("flex");
+                    }
+                    const errorEl = document.getElementById("add-template-error");
+                    if (errorEl) errorEl.textContent = "";
+                    const form = document.getElementById("add-template-form");
+                    if (form) form.reset();
+                });
+            }
+            const cancelTemplateBtn = document.getElementById("add-template-cancel");
+            if (cancelTemplateBtn) {
+                cancelTemplateBtn.addEventListener("click", function () {
+                    const modal = document.getElementById("add-template-modal");
+                    if (modal) {
+                        modal.classList.add("hidden");
+                        modal.classList.remove("flex");
+                    }
+                    const errorEl = document.getElementById("add-template-error");
+                    if (errorEl) errorEl.textContent = "";
+                    const form = document.getElementById("add-template-form");
+                    if (form) form.reset();
+                });
+            }
+            const addTemplateForm = document.getElementById("add-template-form");
+            if (addTemplateForm) {
+                addTemplateForm.addEventListener("submit", async function (event) {
+                    event.preventDefault();
+                    const eventName = (document.getElementById("template-event-name").value || "").trim();
+                    const titleTemplate = (document.getElementById("template-title").value || "").trim();
+                    const bodyTemplate = (document.getElementById("template-body").value || "").trim();
+                    const errorEl = document.getElementById("add-template-error");
+                    const submitBtn = document.getElementById("add-template-submit");
+
+                    errorEl.textContent = "";
+                    if (!eventName || !titleTemplate || !bodyTemplate) {
+                        errorEl.textContent = "Event name, title template, and body template are required.";
+                        return;
+                    }
+
+                    submitBtn.disabled = true;
+                    submitBtn.textContent = "Adding...";
+
+                    try {
+                        const resp = await apiFetch("/v1/admin/notifications/templates", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({
+                                event_name: eventName,
+                                title_template: titleTemplate,
+                                body_template: bodyTemplate,
+                            }),
+                        });
+
+                        if (!resp.ok) {
+                            const data = await resp.json();
+                            throw new Error(data.error || "Failed to create message template");
+                        }
+
+                        const modal = document.getElementById("add-template-modal");
+                        if (modal) {
+                            modal.classList.add("hidden");
+                            modal.classList.remove("flex");
+                        }
+                        const form = document.getElementById("add-template-form");
+                        if (form) form.reset();
+                        loadMessageTemplates();
+                    } catch (err) {
+                        console.error(err);
+                        errorEl.textContent = err.message || "Unexpected error while creating message template.";
+                    } finally {
+                        submitBtn.disabled = false;
+                        submitBtn.textContent = "Add Template";
+                    }
+                });
+            }
+
+            // Telegram Config Modal Events
+            const openTelegramConfigBtn = document.getElementById("open-add-telegram-config");
+            if (openTelegramConfigBtn) {
+                openTelegramConfigBtn.addEventListener("click", function () {
+                    const modal = document.getElementById("add-telegram-config-modal");
+                    if (modal) {
+                        modal.classList.remove("hidden");
+                        modal.classList.add("flex");
+                    }
+                });
+            }
+            const closeTelegramConfigBtn = document.getElementById("add-telegram-config-close");
+            if (closeTelegramConfigBtn) {
+                closeTelegramConfigBtn.addEventListener("click", function () {
+                    const modal = document.getElementById("add-telegram-config-modal");
+                    if (modal) {
+                        modal.classList.add("hidden");
+                        modal.classList.remove("flex");
+                    }
+                    const errorEl = document.getElementById("add-telegram-config-error");
+                    if (errorEl) errorEl.textContent = "";
+                    const form = document.getElementById("add-telegram-config-form");
+                    if (form) form.reset();
+                });
+            }
+            const cancelTelegramConfigBtn = document.getElementById("add-telegram-config-cancel");
+            if (cancelTelegramConfigBtn) {
+                cancelTelegramConfigBtn.addEventListener("click", function () {
+                    const modal = document.getElementById("add-telegram-config-modal");
+                    if (modal) {
+                        modal.classList.add("hidden");
+                        modal.classList.remove("flex");
+                    }
+                    const errorEl = document.getElementById("add-telegram-config-error");
+                    if (errorEl) errorEl.textContent = "";
+                    const form = document.getElementById("add-telegram-config-form");
+                    if (form) form.reset();
+                });
+            }
+            const addTelegramConfigForm = document.getElementById("add-telegram-config-form");
+            if (addTelegramConfigForm) {
+                addTelegramConfigForm.addEventListener("submit", async function (event) {
+                    event.preventDefault();
+                    const token = (document.getElementById("telegram-token").value || "").trim();
+                    const chatID = (document.getElementById("telegram-chat-id").value || "").trim();
+                    const isActive = document.getElementById("telegram-is-active").checked;
+                    const errorEl = document.getElementById("add-telegram-config-error");
+                    const submitBtn = document.getElementById("add-telegram-config-submit");
+
+                    errorEl.textContent = "";
+                    if (!token || !chatID) {
+                        errorEl.textContent = "Bot Token and Chat ID are required.";
+                        return;
+                    }
+
+                    submitBtn.disabled = true;
+                    submitBtn.textContent = "Adding...";
+
+                    try {
+                        const resp = await apiFetch("/v1/admin/notifications/telegram", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({
+                                tg_token: token,
+                                tg_chat_id: chatID,
+                                is_active: isActive,
+                            }),
+                        });
+
+                        if (!resp.ok) {
+                            const data = await resp.json();
+                            throw new Error(data.error || "Failed to create Telegram config");
+                        }
+
+                        const modal = document.getElementById("add-telegram-config-modal");
+                        if (modal) {
+                            modal.classList.add("hidden");
+                            modal.classList.remove("flex");
+                        }
+                        const form = document.getElementById("add-telegram-config-form");
+                        if (form) form.reset();
+                        loadTelegramConfigs();
+                    } catch (err) {
+                        console.error(err);
+                        errorEl.textContent = err.message || "Unexpected error while creating Telegram config.";
+                    } finally {
+                        submitBtn.disabled = false;
+                        submitBtn.textContent = "Add Config";
+                    }
+                });
+            }
+
+            // Telegram Config Form (in Notifications view)
+            const telegramConfigForm = document.getElementById("telegram-config-form");
+            if (telegramConfigForm) {
+                telegramConfigForm.addEventListener("submit", async function (event) {
+                    event.preventDefault();
+                    const token = (document.getElementById("tg-bot-token").value || "").trim();
+                    const chatID = (document.getElementById("tg-chat-id").value || "").trim();
+                    const isActive = document.getElementById("tg-is-active").checked;
+                    const errorEl = document.getElementById("telegram-config-error");
+                    const successEl = document.getElementById("telegram-config-success");
+                    const submitBtn = document.getElementById("save-telegram-config-btn");
+
+                    errorEl.textContent = "";
+                    successEl.textContent = "";
+                    
+                    if (!token || !chatID) {
+                        errorEl.textContent = "Bot Token and Chat ID are required.";
+                        return;
+                    }
+
+                    submitBtn.disabled = true;
+                    submitBtn.textContent = "Saving...";
+
+                    try {
+                        // Check if config exists (load existing configs first)
+                        const listResp = await apiFetch("/v1/admin/notifications/telegram", {
+                            method: "GET",
+                            headers: { "Accept": "application/json" },
+                        });
+                        
+                        let configId = null;
+                        if (listResp.ok) {
+                            const listData = await listResp.json();
+                            const existingConfig = listData.configs && listData.configs[0];
+                            if (existingConfig) {
+                                configId = existingConfig.id;
+                            }
+                        }
+
+                        let resp;
+                        if (configId) {
+                            // Update existing config
+                            resp = await apiFetch("/v1/admin/notifications/telegram/" + configId, {
+                                method: "PUT",
+                                headers: { "Content-Type": "application/json" },
+                                body: JSON.stringify({
+                                    tg_token: token,
+                                    tg_chat_id: chatID,
+                                    is_active: isActive,
+                                }),
+                            });
+                        } else {
+                            // Create new config
+                            resp = await apiFetch("/v1/admin/notifications/telegram", {
+                                method: "POST",
+                                headers: { "Content-Type": "application/json" },
+                                body: JSON.stringify({
+                                    tg_token: token,
+                                    tg_chat_id: chatID,
+                                    is_active: isActive,
+                                }),
+                            });
+                        }
+
+                        if (!resp.ok) {
+                            const data = await resp.json();
+                            throw new Error(data.error || "Failed to save Telegram config");
+                        }
+
+                        successEl.textContent = "Telegram configuration saved successfully!";
+                        loadTelegramConfigs();
+                        
+                        // Clear form after a delay
+                        setTimeout(() => {
+                            successEl.textContent = "";
+                        }, 3000);
+                    } catch (err) {
+                        console.error(err);
+                        errorEl.textContent = err.message || "Unexpected error while saving Telegram config.";
+                    } finally {
+                        submitBtn.disabled = false;
+                        submitBtn.textContent = "Save Config";
+                    }
+                });
+            }
+
+            // Test Telegram Notification Button
+            const testTelegramBtn = document.getElementById("test-telegram-btn");
+            if (testTelegramBtn) {
+                testTelegramBtn.addEventListener("click", async function () {
+                    const token = (document.getElementById("tg-bot-token").value || "").trim();
+                    const chatID = (document.getElementById("tg-chat-id").value || "").trim();
+                    const errorEl = document.getElementById("telegram-config-error");
+                    const successEl = document.getElementById("telegram-config-success");
+
+                    errorEl.textContent = "";
+                    successEl.textContent = "";
+
+                    if (!token || !chatID) {
+                        errorEl.textContent = "Please enter Bot Token and Chat ID first.";
+                        return;
+                    }
+
+                    testTelegramBtn.disabled = true;
+                    testTelegramBtn.textContent = "Testing...";
+
+                    try {
+                        // First, check if config exists
+                        const listResp = await apiFetch("/v1/admin/notifications/telegram", {
+                            method: "GET",
+                            headers: { "Accept": "application/json" },
+                        });
+                        
+                        let configId = null;
+                        if (listResp.ok) {
+                            const listData = await listResp.json();
+                            const existingConfig = listData.configs && listData.configs[0];
+                            if (existingConfig && existingConfig.tg_token === token && existingConfig.tg_chat_id === chatID) {
+                                configId = existingConfig.id;
+                            }
+                        }
+
+                        if (configId) {
+                            // Use existing config ID
+                            const resp = await apiFetch("/v1/admin/notifications/telegram/" + configId + "/test", {
+                                method: "POST",
+                                headers: { "Accept": "application/json" },
+                            });
+
+                            if (!resp.ok) {
+                                const data = await resp.json();
+                                throw new Error(data.error || data.details || "Failed to send test message");
+                            }
+
+                            successEl.textContent = "Test message sent successfully! Check your Telegram.";
+                        } else {
+                            // Send test message directly using the token and chat ID from form
+                            // We'll use a temporary approach: create a config, test it, then optionally delete it
+                            const testMessage = "Hello from ZenStack";
+                            
+                            // Import notify function would be ideal, but we can call the API endpoint
+                            // For now, let's create a temporary config and test it
+                            const createResp = await apiFetch("/v1/admin/notifications/telegram", {
+                                method: "POST",
+                                headers: { "Content-Type": "application/json" },
+                                body: JSON.stringify({
+                                    tg_token: token,
+                                    tg_chat_id: chatID,
+                                    is_active: true,
+                                }),
+                            });
+
+                            if (!createResp.ok) {
+                                const data = await createResp.json();
+                                throw new Error(data.error || "Failed to create test config");
+                            }
+
+                            const newConfig = await createResp.json();
+                            
+                            // Test the connection
+                            const testResp = await apiFetch("/v1/admin/notifications/telegram/" + newConfig.id + "/test", {
+                                method: "POST",
+                                headers: { "Accept": "application/json" },
+                            });
+
+                            if (!testResp.ok) {
+                                // Delete the temp config if test fails
+                                await apiFetch("/v1/admin/notifications/telegram/" + newConfig.id, {
+                                    method: "DELETE",
+                                });
+                                const data = await testResp.json();
+                                throw new Error(data.error || data.details || "Failed to send test message");
+                            }
+
+                            successEl.textContent = "Test message sent successfully! Check your Telegram.";
+                            loadTelegramConfigs();
+                        }
+                    } catch (err) {
+                        console.error(err);
+                        errorEl.textContent = err.message || "Error testing Telegram connection.";
+                    } finally {
+                        testTelegramBtn.disabled = false;
+                        testTelegramBtn.textContent = "Test TG Notification";
+                    }
+                });
+            }
+
+            // Template Editor Save Buttons
+            const saveSiteDownBtn = document.getElementById("save-sitedown-template");
+            if (saveSiteDownBtn) {
+                saveSiteDownBtn.addEventListener("click", async function () {
+                    const textarea = document.getElementById("sitedown-template-text");
+                    if (!textarea) return;
+                    
+                    const templateId = textarea.dataset.templateId;
+                    if (!templateId) {
+                        alert("Template ID not found. Please refresh the page.");
+                        return;
+                    }
+
+                    const templateText = textarea.value.trim();
+                    if (!templateText) {
+                        alert("Template text cannot be empty.");
+                        return;
+                    }
+
+                    saveSiteDownBtn.disabled = true;
+                    saveSiteDownBtn.textContent = "Saving...";
+
+                    try {
+                        const resp = await apiFetch("/v1/admin/notifications/templates/" + templateId, {
+                            method: "PUT",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({
+                                template_text: templateText,
+                            }),
+                        });
+
+                        if (!resp.ok) {
+                            const data = await resp.json();
+                            throw new Error(data.error || "Failed to update template");
+                        }
+
+                        alert("Site Down template saved successfully!");
+                    } catch (err) {
+                        console.error(err);
+                        alert("Error saving template: " + err.message);
+                    } finally {
+                        saveSiteDownBtn.disabled = false;
+                        saveSiteDownBtn.textContent = "Save";
+                    }
+                });
+            }
+
+            const saveSSLExpiredBtn = document.getElementById("save-sslexpired-template");
+            if (saveSSLExpiredBtn) {
+                saveSSLExpiredBtn.addEventListener("click", async function () {
+                    const textarea = document.getElementById("sslexpired-template-text");
+                    if (!textarea) return;
+                    
+                    const templateId = textarea.dataset.templateId;
+                    if (!templateId) {
+                        alert("Template ID not found. Please refresh the page.");
+                        return;
+                    }
+
+                    const templateText = textarea.value.trim();
+                    if (!templateText) {
+                        alert("Template text cannot be empty.");
+                        return;
+                    }
+
+                    saveSSLExpiredBtn.disabled = true;
+                    saveSSLExpiredBtn.textContent = "Saving...";
+
+                    try {
+                        const resp = await apiFetch("/v1/admin/notifications/templates/" + templateId, {
+                            method: "PUT",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({
+                                template_text: templateText,
+                            }),
+                        });
+
+                        if (!resp.ok) {
+                            const data = await resp.json();
+                            throw new Error(data.error || "Failed to update template");
+                        }
+
+                        alert("SSL Expiring template saved successfully!");
+                    } catch (err) {
+                        console.error(err);
+                        alert("Error saving template: " + err.message);
+                    } finally {
+                        saveSSLExpiredBtn.disabled = false;
+                        saveSSLExpiredBtn.textContent = "Save";
+                    }
+                });
+            }
+        }
+
             // Infra actions
             const infraBtn = document.getElementById("infra-submit");
             if (infraBtn) {
@@ -1823,6 +3938,11 @@ func handleDashboard(c *gin.Context) {
             const refreshProjectsBtn = document.getElementById("refresh-projects");
             if (refreshProjectsBtn) {
                 refreshProjectsBtn.addEventListener("click", loadProjects);
+            }
+
+            const refreshDomainsBtn = document.getElementById("refresh-domains");
+            if (refreshDomainsBtn) {
+                refreshDomainsBtn.addEventListener("click", loadDomains);
             }
 
             const refreshInfraBtn = document.getElementById("refresh-infra");
@@ -1849,52 +3969,72 @@ func handleDashboard(c *gin.Context) {
                 });
             }
 
-            const loginForm = document.getElementById("login-form");
-            if (loginForm) {
-                loginForm.addEventListener("submit", async function (event) {
-                    event.preventDefault();
-                    const username = (document.getElementById("login-username").value || "").trim();
-                    const password = (document.getElementById("login-password").value || "").trim();
-                    const errorEl = document.getElementById("login-error");
-                    const submitBtn = document.getElementById("login-submit");
+            // Initialize login form - independent function that doesn't depend on admin pages
+            function initLogin() {
+                const loginForm = document.getElementById("login-form");
+                if (loginForm) {
+                    loginForm.addEventListener("submit", async function (event) {
+                        event.preventDefault();
+                        const usernameEl = document.getElementById("login-username");
+                        const passwordEl = document.getElementById("login-password");
+                        const errorEl = document.getElementById("login-error");
+                        const submitBtn = document.getElementById("login-submit");
 
-                    errorEl.textContent = "";
-                    if (!username || !password) {
-                        errorEl.textContent = "Username and password are required.";
-                        return;
-                    }
-
-                    submitBtn.disabled = true;
-                    try {
-                        // Login flow only (public registration is disabled)
-                        const resp = await fetch("/v1/auth/login", {
-                            method: "POST",
-                            headers: {
-                                "Content-Type": "application/json",
-                                "Accept": "application/json",
-                            },
-                            body: JSON.stringify({ username, password }),
-                        });
-                        const data = await resp.json().catch(() => ({}));
-                        if (!resp.ok) {
-                            const msg = data && data.error ? data.error : "Login failed.";
-                            throw new Error(msg);
+                        if (!usernameEl || !passwordEl || !errorEl || !submitBtn) {
+                            console.error("Login form elements not found");
+                            return;
                         }
-                        saveAuth(data.token, { username: data.username, role: data.role });
-                        updateUserUI();
-                        ensureAuthenticated();
-                        // Load initial data after login
-                        loadProjects();
-                        loadInfraOptions();
-                        loadInfraResources();
-                    } catch (err) {
-                        console.error(err);
-                        errorEl.textContent = err.message || "Unexpected error while logging in.";
-                    } finally {
-                        submitBtn.disabled = false;
-                    }
-                });
+
+                        const username = (usernameEl.value || "").trim();
+                        const password = (passwordEl.value || "").trim();
+
+                        errorEl.textContent = "";
+                        if (!username || !password) {
+                            errorEl.textContent = "Username and password are required.";
+                            return;
+                        }
+
+                        submitBtn.disabled = true;
+                        try {
+                            // Login flow only (public registration is disabled)
+                            const resp = await fetch("/v1/auth/login", {
+                                method: "POST",
+                                headers: {
+                                    "Content-Type": "application/json",
+                                    "Accept": "application/json",
+                                },
+                                body: JSON.stringify({ username, password }),
+                            });
+                            const data = await resp.json().catch(() => ({}));
+                            if (!resp.ok) {
+                                const msg = data && data.error ? data.error : "Login failed.";
+                                throw new Error(msg);
+                            }
+                            saveAuth(data.token, { username: data.username, role: data.role });
+                            updateUserUI();
+                            ensureAuthenticated();
+                            // Switch to dashboard view after login
+                            setActiveView("dashboard");
+                            // Also call showSection for compatibility if it exists
+                            if (typeof showSection === 'function') {
+                                showSection('dashboard');
+                            }
+                            // Load initial data after login
+                            if (typeof loadProjects === 'function') loadProjects();
+                            if (typeof loadInfraOptions === 'function') loadInfraOptions();
+                            if (typeof loadInfraResources === 'function') loadInfraResources();
+                        } catch (err) {
+                            console.error(err);
+                            errorEl.textContent = err.message || "Unexpected error while logging in.";
+                        } finally {
+                            submitBtn.disabled = false;
+                        }
+                    });
+                }
             }
+
+            // Initialize login immediately (doesn't depend on admin pages)
+            initLogin();
 
             // Catalog "View API" buttons
             const apiButtons = document.querySelectorAll(".view-api-btn");
@@ -2428,6 +4568,212 @@ func handleRejectUser(c *gin.Context) {
 	})
 }
 
+// handleDashboardStats returns dashboard statistics for admin users
+func handleDashboardStats(c *gin.Context) {
+	if database.DB == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not initialized"})
+		return
+	}
+
+	// Calculate total domains
+	var totalDomains int64
+	database.DB.Model(&database.MonitoredDomain{}).Count(&totalDomains)
+
+	// Calculate SSL critical domains - count by ssl_status field dynamically
+	var sslCritical int64
+	database.DB.Model(&database.MonitoredDomain{}).
+		Where("ssl_status = ?", "Critical").
+		Count(&sslCritical)
+
+	// Calculate SSL warning domains - count by ssl_status field dynamically
+	var sslWarning int64
+	database.DB.Model(&database.MonitoredDomain{}).
+		Where("ssl_status = ?", "Warning").
+		Count(&sslWarning)
+
+	// Calculate domains expiring in the next 30 days (for backward compatibility)
+	var expiringSoonCount int64
+	thirtyDaysFromNow := time.Now().AddDate(0, 0, 30)
+	database.DB.Model(&database.MonitoredDomain{}).
+		Where("last_expiry_date <= ? AND last_expiry_date >= ?", thirtyDaysFromNow, time.Now()).
+		Count(&expiringSoonCount)
+
+	// Calculate total projects
+	var projectCount int64
+	database.DB.Model(&database.Project{}).Count(&projectCount)
+
+	// Calculate active users
+	var activeUsers int64
+	database.DB.Model(&database.User{}).Where("status = ?", "active").Count(&activeUsers)
+
+	// Calculate global availability (percentage of live domains)
+	var totalLive int64
+	database.DB.Model(&database.MonitoredDomain{}).Where("is_live = ?", true).Count(&totalLive)
+	var globalAvailability float64
+	if totalDomains > 0 {
+		globalAvailability = float64(totalLive) / float64(totalDomains) * 100.0
+	}
+
+	// Calculate sites down (domains that are not live)
+	var sitesDown int64
+	database.DB.Model(&database.MonitoredDomain{}).Where("is_live = ?", false).Count(&sitesDown)
+
+	// Get all domains for suffix distribution and monthly expiry analysis
+	var domains []database.MonitoredDomain
+	database.DB.Find(&domains)
+
+	// Calculate domain suffix distribution
+	suffixCounts := make(map[string]int)
+	for _, domain := range domains {
+		suffix := extractDomainSuffix(domain.DomainName)
+		suffixCounts[suffix]++
+	}
+
+	// Convert suffix counts to map for JSON response
+	suffixDistribution := make(map[string]int)
+	for suffix, count := range suffixCounts {
+		suffixDistribution[suffix] = count
+	}
+
+	// Calculate monthly expiring domains (next 12 months) based on SSL expiry
+	monthlyExpiry := make(map[string]int)
+	now := time.Now()
+	for i := 0; i < 12; i++ {
+		monthStart := time.Date(now.Year(), now.Month()+time.Month(i), 1, 0, 0, 0, 0, now.Location())
+		monthEnd := monthStart.AddDate(0, 1, 0).Add(-time.Second)
+		monthKey := monthStart.Format("2006-01")
+
+		var count int64
+		database.DB.Model(&database.MonitoredDomain{}).
+			Where("ssl_expiry >= ? AND ssl_expiry <= ?", monthStart, monthEnd).
+			Count(&count)
+		monthlyExpiry[monthKey] = int(count)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"total_domains":       totalDomains,
+		"totalDomains":        totalDomains, // Alias for consistency
+		"sslCritical":         sslCritical,
+		"sslWarning":          sslWarning,
+		"expiring_soon_count": expiringSoonCount,
+		"project_count":       projectCount,
+		"active_users":        activeUsers,
+		"global_availability": globalAvailability,
+		"total_live":          totalLive,
+		"sites_down":          sitesDown,
+		"suffix_distribution": suffixDistribution,
+		"monthly_expiry":      monthlyExpiry,
+	})
+}
+
+// extractDomainSuffix extracts the TLD suffix from a domain name (e.g., "example.com" -> ".com")
+func extractDomainSuffix(domainName string) string {
+	parts := strings.Split(domainName, ".")
+	if len(parts) < 2 {
+		return "other"
+	}
+	// Get the last part as the suffix
+	suffix := "." + parts[len(parts)-1]
+	// Handle common suffixes
+	if suffix == ".com" || suffix == ".net" || suffix == ".org" || suffix == ".io" ||
+		suffix == ".jp" || suffix == ".cn" || suffix == ".co" || suffix == ".dev" {
+		return suffix
+	}
+	// For other suffixes, return as is
+	return suffix
+}
+
+// handleListDomains returns all monitored domains from the database
+func handleListDomains(c *gin.Context) {
+	if database.DB == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "database not initialized",
+		})
+		return
+	}
+
+	var domains []database.MonitoredDomain
+	if err := database.DB.Order("created_at desc").Find(&domains).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "failed to fetch domains",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, domains)
+}
+
+// handleUpdateAutoRenew updates the auto-renew setting for a domain
+func handleUpdateAutoRenew(c *gin.Context) {
+	if database.DB == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not initialized"})
+		return
+	}
+
+	id := c.Param("id")
+	if id == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "domain ID is required"})
+		return
+	}
+
+	var body struct {
+		AutoRenew bool `json:"auto_renew"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	var domain database.MonitoredDomain
+	if err := database.DB.First(&domain, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "domain not found"})
+		return
+	}
+
+	if err := database.DB.Model(&domain).Update("auto_renew", body.AutoRenew).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update auto-renew setting"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"id":         domain.ID,
+		"auto_renew": body.AutoRenew,
+	})
+}
+
+// handleManualRenew attempts to manually renew a domain (placeholder for third-party API integration)
+func handleManualRenew(c *gin.Context) {
+	if database.DB == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not initialized"})
+		return
+	}
+
+	id := c.Param("id")
+	if id == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "domain ID is required"})
+		return
+	}
+
+	var domain database.MonitoredDomain
+	if err := database.DB.First(&domain, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "domain not found"})
+		return
+	}
+
+	// TODO: Integrate with GoDaddy or Cloudflare API for actual renewal
+	// For now, this is a placeholder that just returns a success message
+	// In a real implementation, you would:
+	// 1. Check if API keys are configured
+	// 2. Call the registrar's API to renew the domain
+	// 3. Update the domain's expiry date in the database
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Manual renewal initiated (placeholder - API integration required)",
+		"domain":  domain.DomainName,
+		"note":    "This endpoint requires GoDaddy or Cloudflare API key configuration",
+	})
+}
+
 // handleScan processes the scan request
 func handleScan(c *gin.Context) {
 	// Get domains from query parameter
@@ -2463,6 +4809,48 @@ func handleScan(c *gin.Context) {
 
 		// Print colored status to console
 		printResult(result, status)
+
+		// Save or update domain in database
+		if database.DB != nil {
+			sslStatus := getSSLStatus(result.DaysRemaining)
+			now := time.Now()
+
+			var existingDomain database.MonitoredDomain
+			err := database.DB.Where("domain_name = ?", result.DomainName).First(&existingDomain).Error
+
+			updateData := map[string]interface{}{
+				"ssl_expiry":      result.ExpiryDate,
+				"ssl_status":      sslStatus,
+				"last_check_time": now,
+				"status":          status,
+			}
+
+			if !result.DomainExpiryDate.IsZero() {
+				updateData["last_expiry_date"] = result.DomainExpiryDate
+			}
+
+			if result.Registrar != "" {
+				updateData["registrar"] = result.Registrar
+			}
+
+			if err != nil {
+				// Domain doesn't exist, create new
+				newDomain := database.MonitoredDomain{
+					DomainName:     result.DomainName,
+					SSLExpiry:      result.ExpiryDate,
+					SSLStatus:      sslStatus,
+					LastCheckTime:  now,
+					Status:         status,
+					LastExpiryDate: result.DomainExpiryDate,
+					Registrar:      result.Registrar,
+					AutoRenew:      false,
+				}
+				database.DB.Create(&newDomain)
+			} else {
+				// Update existing domain
+				database.DB.Model(&existingDomain).Updates(updateData)
+			}
+		}
 
 		resultsWithStatus = append(resultsWithStatus, ScanResultWithStatus{
 			ScanResult: result,
@@ -2600,4 +4988,918 @@ func printSummary(totalScanned, atRisk int) {
 		color.Green("At Risk Domains: %d\n", atRisk)
 	}
 	fmt.Println(strings.Repeat("=", 60))
+}
+
+// deepScanSSL performs a deep SSL certificate scan using tls.DialWithDialer with 5s timeout
+func deepScanSSL(domainName string) SSLScanResult {
+	// Set a connection timeout to 5 seconds
+	dialer := &net.Dialer{
+		Timeout: 5 * time.Second,
+	}
+
+	// Connect to port 443 (HTTPS)
+	// InsecureSkipVerify is set to true to fetch info even if the cert is expired
+	conn, err := tls.DialWithDialer(dialer, "tcp", domainName+":443", &tls.Config{
+		InsecureSkipVerify: true,
+	})
+
+	if err != nil {
+		return SSLScanResult{
+			DomainName:    domainName,
+			IsReachable:   false,
+			DaysRemaining: -1,
+		}
+	}
+	defer conn.Close()
+
+	// Get the first certificate in the peer chain
+	if len(conn.ConnectionState().PeerCertificates) == 0 {
+		return SSLScanResult{
+			DomainName:    domainName,
+			IsReachable:   false,
+			DaysRemaining: -1,
+		}
+	}
+
+	cert := conn.ConnectionState().PeerCertificates[0]
+
+	// Parse PeerCertificates[0].NotAfter to get SSL expiry
+	expiryUTC := cert.NotAfter
+	expiryLocal := expiryUTC.In(time.Local)
+
+	// Calculate days remaining using math.Ceil for more intuitive countdown
+	daysRemaining := int(math.Ceil(time.Until(expiryLocal).Hours() / 24))
+
+	return SSLScanResult{
+		DomainName:    domainName,
+		ExpiryDate:    expiryLocal,
+		DaysRemaining: daysRemaining,
+		IsReachable:   true,
+	}
+}
+
+// getSSLStatus determines the SSL status based on days remaining
+func getSSLStatus(daysRemaining int) string {
+	if daysRemaining < 0 {
+		return "Expired"
+	}
+	if daysRemaining < 7 {
+		return "Critical"
+	}
+	if daysRemaining < 15 {
+		return "Warning"
+	}
+	return "Valid"
+}
+
+// startSSLScanner runs in the background and scans all domains every 6 hours
+func startSSLScanner() {
+	// Run immediately on startup, then every 6 hours
+	ticker := time.NewTicker(6 * time.Hour)
+	defer ticker.Stop()
+
+	// Initial scan
+	scanAllDomainsSSL()
+
+	// Periodic scans
+	for range ticker.C {
+		scanAllDomainsSSL()
+	}
+}
+
+// scanSSLTask is an alias for backward compatibility
+func scanSSLTask() {
+	startSSLScanner()
+}
+
+// scanAllDomainsSSL scans all domains in the database and updates SSL information
+func scanAllDomainsSSL() {
+	if database.DB == nil {
+		log.Println("Database not initialized, skipping SSL scan")
+		return
+	}
+
+	log.Println("Starting background SSL certificate scan...")
+
+	var domains []database.MonitoredDomain
+	if err := database.DB.Find(&domains).Error; err != nil {
+		log.Printf("Error fetching domains for SSL scan: %v", err)
+		return
+	}
+
+	if len(domains) == 0 {
+		log.Println("No domains to scan")
+		return
+	}
+
+	log.Printf("Scanning %d domains for SSL certificates...", len(domains))
+
+	// Scan domains with a worker pool
+	jobs := make(chan database.MonitoredDomain, len(domains))
+	results := make(chan struct {
+		domain database.MonitoredDomain
+		result SSLScanResult
+	}, len(domains))
+
+	var wg sync.WaitGroup
+
+	// Start workers
+	for i := 0; i < workerPoolSize; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for d := range jobs {
+				result := deepScanSSL(d.DomainName)
+				results <- struct {
+					domain database.MonitoredDomain
+					result SSLScanResult
+				}{domain: d, result: result}
+			}
+		}()
+	}
+
+	// Send jobs
+	for _, d := range domains {
+		jobs <- d
+	}
+	close(jobs)
+
+	// Wait for completion
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Process results
+	updated := 0
+	for res := range results {
+		sslStatus := getSSLStatus(res.result.DaysRemaining)
+		now := time.Now()
+
+		updateData := map[string]interface{}{
+			"ssl_expiry":      res.result.ExpiryDate,
+			"ssl_status":      sslStatus,
+			"last_check_time": now,
+		}
+
+		// If domain is not reachable, set status to "Offline"
+		if !res.result.IsReachable {
+			updateData["ssl_status"] = "Offline"
+		}
+
+		if err := database.DB.Model(&res.domain).Updates(updateData).Error; err != nil {
+			log.Printf("Error updating domain %s: %v", res.domain.DomainName, err)
+		} else {
+			updated++
+
+			// Check if we need to send a notification for SSL Expiring (days remaining < 7)
+			if res.result.DaysRemaining < 7 && res.result.DaysRemaining >= 0 {
+				// Reload domain to get updated SSL status
+				var updatedDomain database.MonitoredDomain
+				if err := database.DB.First(&updatedDomain, res.domain.ID).Error; err == nil {
+					// Check if notification was sent in the last 24 hours
+					shouldNotify := false
+					if updatedDomain.LastNotificationSent.IsZero() {
+						// Never sent a notification before
+						shouldNotify = true
+					} else {
+						// Check if 24 hours have passed since last notification
+						timeSinceLastNotification := now.Sub(updatedDomain.LastNotificationSent)
+						if timeSinceLastNotification >= 24*time.Hour {
+							shouldNotify = true
+						}
+					}
+
+					if shouldNotify {
+						// Get message template for SSL Risk event
+						var template database.MessageTemplate
+						if err := database.DB.Where("event_name = ? OR name = ?", "SSL_CRITICAL", "SSLExpired").First(&template).Error; err == nil {
+							// Prepare data for template
+							data := map[string]string{
+								"domain":         updatedDomain.DomainName,
+								"days":           fmt.Sprintf("%d", res.result.DaysRemaining),
+								"days_remaining": fmt.Sprintf("%d", res.result.DaysRemaining),
+								"expiry":         updatedDomain.SSLExpiry.Format("2006-01-02 15:04:05"),
+								"expiry_date":    updatedDomain.SSLExpiry.Format("2006-01-02"),
+							}
+
+							// Format template text
+							telegramText := notify.ParseTemplate(template.TemplateText, data)
+							if telegramText == "" {
+								// Fallback message if template is empty
+								telegramText = fmt.Sprintf("🔒 证书预警：域名 %s 的 SSL 证书将在 %d 天后过期。", updatedDomain.DomainName, res.result.DaysRemaining)
+							}
+
+							// Send to Telegram using sendTelegramAlert function
+							if err := notify.SendTelegramAlert(telegramText); err != nil {
+								log.Printf("Failed to send Telegram notification for domain %s: %v", updatedDomain.DomainName, err)
+							} else {
+								log.Printf("Telegram notification sent for SSL Risk domain: %s (Days: %d)", updatedDomain.DomainName, res.result.DaysRemaining)
+								// Update last_notification_sent timestamp
+								database.DB.Model(&updatedDomain).Update("last_notification_sent", now)
+							}
+						} else {
+							log.Printf("No template found for SSL Risk event, using default message")
+							// Send default message if no template found
+							defaultMessage := fmt.Sprintf("🔒 证书预警：域名 %s 的 SSL 证书将在 %d 天后过期。", updatedDomain.DomainName, res.result.DaysRemaining)
+							if err := notify.SendTelegramAlert(defaultMessage); err != nil {
+								log.Printf("Failed to send Telegram notification for domain %s: %v", updatedDomain.DomainName, err)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	log.Printf("SSL scan completed. Updated %d/%d domains", updated, len(domains))
+}
+
+// HealthCheckResult represents the result of an HTTP health check
+type HealthCheckResult struct {
+	DomainName   string
+	IsLive       bool
+	StatusCode   int
+	ResponseTime int // in milliseconds
+}
+
+// checkDomainHealth performs an HTTP health check on a domain using http.Get
+// Uses http.Client with 5s timeout to make GET requests
+func checkDomainHealth(domainName string) HealthCheckResult {
+	startTime := time.Now()
+
+	// Try HTTPS first, then HTTP
+	urls := []string{
+		"https://" + domainName,
+		"http://" + domainName,
+	}
+
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+	}
+
+	for _, urlStr := range urls {
+		// Use http.Get as requested
+		resp, err := client.Get(urlStr)
+		if err != nil {
+			continue
+		}
+		defer resp.Body.Close()
+
+		// Calculate response time
+		responseTime := int(time.Since(startTime).Milliseconds())
+
+		// Consider 2xx and 3xx status codes as "live"
+		isLive := resp.StatusCode >= 200 && resp.StatusCode < 400
+
+		return HealthCheckResult{
+			DomainName:   domainName,
+			IsLive:       isLive,
+			StatusCode:   resp.StatusCode,
+			ResponseTime: responseTime,
+		}
+	}
+
+	// If both HTTPS and HTTP failed, domain is not live
+	return HealthCheckResult{
+		DomainName:   domainName,
+		IsLive:       false,
+		StatusCode:   0,
+		ResponseTime: int(time.Since(startTime).Milliseconds()),
+	}
+}
+
+// startLiveMonitor runs in the background and checks domain health every 2 minutes
+// It performs HTTP GET requests to check if domains are live and updates IsLive and LastStatusCode
+func startLiveMonitor() {
+	// Run immediately on startup
+	checkAllDomainsHealth()
+
+	// Use a ticker that runs every 2 minutes
+	ticker := time.NewTicker(2 * time.Minute)
+	defer ticker.Stop()
+
+	// Periodic checks
+	for range ticker.C {
+		checkAllDomainsHealth()
+	}
+}
+
+// checkSiteLive is an alias for startLiveMonitor (backward compatibility)
+func checkSiteLive() {
+	startLiveMonitor()
+}
+
+// startHealthCheck is an alias for checkSiteLive (backward compatibility)
+func startHealthCheck() {
+	checkSiteLive()
+}
+
+// startHealthChecker is an alias for startHealthCheck (backward compatibility)
+func startHealthChecker() {
+	startHealthCheck()
+}
+
+// checkAllDomainsHealth checks the HTTP health of all domains in the database
+func checkAllDomainsHealth() {
+	if database.DB == nil {
+		log.Println("Database not initialized, skipping health check")
+		return
+	}
+
+	log.Println("Starting background HTTP health check...")
+
+	var domains []database.MonitoredDomain
+	if err := database.DB.Find(&domains).Error; err != nil {
+		log.Printf("Error fetching domains for health check: %v", err)
+		return
+	}
+
+	if len(domains) == 0 {
+		log.Println("No domains to check")
+		return
+	}
+
+	log.Printf("Checking HTTP health for %d domains...", len(domains))
+
+	// Check domains with a worker pool
+	jobs := make(chan database.MonitoredDomain, len(domains))
+	results := make(chan struct {
+		domain database.MonitoredDomain
+		result HealthCheckResult
+	}, len(domains))
+
+	var wg sync.WaitGroup
+
+	// Start workers
+	for i := 0; i < workerPoolSize; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for d := range jobs {
+				result := checkDomainHealth(d.DomainName)
+				results <- struct {
+					domain database.MonitoredDomain
+					result HealthCheckResult
+				}{domain: d, result: result}
+			}
+		}()
+	}
+
+	// Send jobs
+	for _, d := range domains {
+		jobs <- d
+	}
+	close(jobs)
+
+	// Wait for completion
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Process results
+	updated := 0
+	for res := range results {
+		// Track previous state to detect transitions from Live to Down
+		wasLive := res.domain.IsLive
+		nowLive := res.result.IsLive
+
+		updateData := map[string]interface{}{
+			"is_live":          res.result.IsLive,
+			"status_code":      res.result.StatusCode,
+			"last_status_code": res.result.StatusCode, // Update LastStatusCode
+			"response_time":    res.result.ResponseTime,
+		}
+
+		if err := database.DB.Model(&res.domain).Updates(updateData).Error; err != nil {
+			log.Printf("Error updating domain health %s: %v", res.domain.DomainName, err)
+		} else {
+			updated++
+
+			// Trigger Telegram notification if site transitions from Live to Down
+			if wasLive && !nowLive {
+				// Site went from Live to Down - immediately send Telegram notification
+				log.Printf("Domain %s transitioned from Live to Down, sending Telegram notification", res.domain.DomainName)
+
+				// Get message template for SITE_DOWN event
+				var template database.MessageTemplate
+				if err := database.DB.Where("event_name = ? OR name = ?", "SITE_DOWN", "SiteDown").First(&template).Error; err == nil {
+					// Prepare data for template
+					data := map[string]string{
+						"domain":      res.domain.DomainName,
+						"status":      fmt.Sprintf("%d", res.result.StatusCode),
+						"status_code": fmt.Sprintf("%d", res.result.StatusCode),
+						"code":        fmt.Sprintf("%d", res.result.StatusCode), // Alias for code variable
+					}
+
+					// Format template text
+					telegramText := notify.ParseTemplate(template.TemplateText, data)
+					if telegramText == "" {
+						// Fallback message if template is empty
+						telegramText = fmt.Sprintf("🚨 告警：站点 %s 无法访问！状态码：%d", res.domain.DomainName, res.result.StatusCode)
+					}
+
+					// Send to Telegram using sendTelegramAlert function
+					// sendTelegramAlert automatically reads config from database
+					if err := notify.SendTelegramAlert(telegramText); err != nil {
+						log.Printf("Failed to send Telegram notification for domain %s: %v", res.domain.DomainName, err)
+					} else {
+						log.Printf("Telegram notification sent for domain %s (Live -> Down)", res.domain.DomainName)
+					}
+				} else {
+					log.Printf("No template found for SITE_DOWN event, using default message")
+					// Send default message if no template found
+					defaultMessage := fmt.Sprintf("🚨 告警：站点 %s 无法访问！状态码：%d", res.domain.DomainName, res.result.StatusCode)
+					if err := notify.SendTelegramAlert(defaultMessage); err != nil {
+						log.Printf("Failed to send Telegram notification for domain %s: %v", res.domain.DomainName, err)
+					}
+				}
+			}
+		}
+	}
+
+	log.Printf("Health check completed. Updated %d/%d domains", updated, len(domains))
+}
+
+// Notification Configuration Handlers
+
+// handleListNotificationConfigs returns all notification configurations
+func handleListNotificationConfigs(c *gin.Context) {
+	if database.DB == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not initialized"})
+		return
+	}
+
+	var configs []database.NotificationConfig
+	if err := database.DB.Order("created_at desc").Find(&configs).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list notification configs"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"configs": configs})
+}
+
+// handleCreateNotificationConfig creates a new notification configuration
+func handleCreateNotificationConfig(c *gin.Context) {
+	if database.DB == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not initialized"})
+		return
+	}
+
+	var body struct {
+		WebhookURL string `json:"webhook_url"`
+		SecretKey  string `json:"secret_key"`
+		Platform   string `json:"platform"`
+		IsActive   bool   `json:"is_active"`
+	}
+
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	if body.WebhookURL == "" || body.Platform == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "webhook_url and platform are required"})
+		return
+	}
+
+	config := database.NotificationConfig{
+		WebhookURL: body.WebhookURL,
+		SecretKey:  body.SecretKey,
+		Platform:   body.Platform,
+		IsActive:   body.IsActive,
+	}
+
+	if err := database.DB.Create(&config).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create notification config"})
+		return
+	}
+
+	c.JSON(http.StatusCreated, config)
+}
+
+// handleUpdateNotificationConfig updates an existing notification configuration
+func handleUpdateNotificationConfig(c *gin.Context) {
+	if database.DB == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not initialized"})
+		return
+	}
+
+	id := c.Param("id")
+	if id == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "config ID is required"})
+		return
+	}
+
+	var config database.NotificationConfig
+	if err := database.DB.First(&config, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "notification config not found"})
+		return
+	}
+
+	var body struct {
+		WebhookURL string `json:"webhook_url"`
+		SecretKey  string `json:"secret_key"`
+		Platform   string `json:"platform"`
+		IsActive   bool   `json:"is_active"`
+	}
+
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	updateData := map[string]interface{}{
+		"platform":  body.Platform,
+		"is_active": body.IsActive,
+	}
+
+	if body.WebhookURL != "" {
+		updateData["webhook_url"] = body.WebhookURL
+	}
+	if body.SecretKey != "" {
+		updateData["secret_key"] = body.SecretKey
+	}
+
+	if err := database.DB.Model(&config).Updates(updateData).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update notification config"})
+		return
+	}
+
+	c.JSON(http.StatusOK, config)
+}
+
+// handleDeleteNotificationConfig deletes a notification configuration
+func handleDeleteNotificationConfig(c *gin.Context) {
+	if database.DB == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not initialized"})
+		return
+	}
+
+	id := c.Param("id")
+	if id == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "config ID is required"})
+		return
+	}
+
+	if err := database.DB.Delete(&database.NotificationConfig{}, id).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete notification config"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "notification config deleted"})
+}
+
+// Message Template Handlers
+
+// handleListMessageTemplates returns all message templates
+func handleListMessageTemplates(c *gin.Context) {
+	if database.DB == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not initialized"})
+		return
+	}
+
+	var templates []database.MessageTemplate
+	if err := database.DB.Order("created_at desc").Find(&templates).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list message templates"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"templates": templates})
+}
+
+// handleCreateMessageTemplate creates a new message template
+func handleCreateMessageTemplate(c *gin.Context) {
+	if database.DB == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not initialized"})
+		return
+	}
+
+	var body struct {
+		EventName     string `json:"event_name"`
+		TitleTemplate string `json:"title_template"`
+		BodyTemplate  string `json:"body_template"`
+	}
+
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	if body.EventName == "" || body.TitleTemplate == "" || body.BodyTemplate == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "event_name, title_template, and body_template are required"})
+		return
+	}
+
+	template := database.MessageTemplate{
+		EventName:     body.EventName,
+		TitleTemplate: body.TitleTemplate,
+		BodyTemplate:  body.BodyTemplate,
+	}
+
+	if err := database.DB.Create(&template).Error; err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+			c.JSON(http.StatusConflict, gin.H{"error": "template for this event already exists"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create message template"})
+		return
+	}
+
+	c.JSON(http.StatusCreated, template)
+}
+
+// handleUpdateMessageTemplate updates an existing message template
+func handleUpdateMessageTemplate(c *gin.Context) {
+	if database.DB == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not initialized"})
+		return
+	}
+
+	id := c.Param("id")
+	if id == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "template ID is required"})
+		return
+	}
+
+	var template database.MessageTemplate
+	if err := database.DB.First(&template, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "message template not found"})
+		return
+	}
+
+	var body struct {
+		EventName     string `json:"event_name"`
+		TitleTemplate string `json:"title_template"`
+		BodyTemplate  string `json:"body_template"`
+		TemplateText  string `json:"template_text"`
+	}
+
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	updateData := map[string]interface{}{}
+	if body.EventName != "" {
+		updateData["event_name"] = body.EventName
+	}
+	if body.TitleTemplate != "" {
+		updateData["title_template"] = body.TitleTemplate
+	}
+	if body.BodyTemplate != "" {
+		updateData["body_template"] = body.BodyTemplate
+	}
+	if body.TemplateText != "" {
+		updateData["template_text"] = body.TemplateText
+	}
+
+	if err := database.DB.Model(&template).Updates(updateData).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update message template"})
+		return
+	}
+
+	c.JSON(http.StatusOK, template)
+}
+
+// handleDeleteMessageTemplate deletes a message template
+func handleDeleteMessageTemplate(c *gin.Context) {
+	if database.DB == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not initialized"})
+		return
+	}
+
+	id := c.Param("id")
+	if id == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "template ID is required"})
+		return
+	}
+
+	if err := database.DB.Delete(&database.MessageTemplate{}, id).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete message template"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "message template deleted"})
+}
+
+// Telegram Notification Config Handlers
+
+// handleListTelegramConfigs returns all Telegram notification configurations
+func handleListTelegramConfigs(c *gin.Context) {
+	if database.DB == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not initialized"})
+		return
+	}
+
+	var configs []database.NotifyConfig
+	if err := database.DB.Order("created_at desc").Find(&configs).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list telegram configs"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"configs": configs})
+}
+
+// handleCreateTelegramConfig creates a new Telegram notification configuration
+func handleCreateTelegramConfig(c *gin.Context) {
+	if database.DB == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not initialized"})
+		return
+	}
+
+	var body struct {
+		TGToken  string `json:"tg_token"`
+		TGChatID string `json:"tg_chat_id"`
+		IsActive bool   `json:"is_active"`
+	}
+
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	if body.TGToken == "" || body.TGChatID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "tg_token and tg_chat_id are required"})
+		return
+	}
+
+	config := database.NotifyConfig{
+		TGToken:  body.TGToken,
+		TGChatID: body.TGChatID,
+		IsActive: body.IsActive,
+	}
+
+	if err := database.DB.Create(&config).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create telegram config"})
+		return
+	}
+
+	c.JSON(http.StatusCreated, config)
+}
+
+// handleUpdateTelegramConfig updates an existing Telegram notification configuration
+func handleUpdateTelegramConfig(c *gin.Context) {
+	if database.DB == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not initialized"})
+		return
+	}
+
+	id := c.Param("id")
+	if id == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "config ID is required"})
+		return
+	}
+
+	var config database.NotifyConfig
+	if err := database.DB.First(&config, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "telegram config not found"})
+		return
+	}
+
+	var body struct {
+		TGToken  string `json:"tg_token"`
+		TGChatID string `json:"tg_chat_id"`
+		IsActive bool   `json:"is_active"`
+	}
+
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	updateData := map[string]interface{}{
+		"is_active": body.IsActive,
+	}
+
+	if body.TGToken != "" {
+		updateData["tg_token"] = body.TGToken
+	}
+	if body.TGChatID != "" {
+		updateData["tg_chat_id"] = body.TGChatID
+	}
+
+	if err := database.DB.Model(&config).Updates(updateData).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update telegram config"})
+		return
+	}
+
+	c.JSON(http.StatusOK, config)
+}
+
+// handleDeleteTelegramConfig deletes a Telegram notification configuration
+func handleDeleteTelegramConfig(c *gin.Context) {
+	if database.DB == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not initialized"})
+		return
+	}
+
+	id := c.Param("id")
+	if id == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "config ID is required"})
+		return
+	}
+
+	if err := database.DB.Delete(&database.NotifyConfig{}, id).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete telegram config"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "telegram config deleted"})
+}
+
+// handleSaveTelegramSettings saves or updates Telegram bot token and chat ID
+// This is a simplified endpoint that creates or updates the first active Telegram config
+func handleSaveTelegramSettings(c *gin.Context) {
+	if database.DB == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not initialized"})
+		return
+	}
+
+	var body struct {
+		Token  string `json:"token"`
+		ChatID string `json:"chat_id"`
+	}
+
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	if body.Token == "" || body.ChatID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "token and chat_id are required"})
+		return
+	}
+
+	// Check if a Telegram config already exists
+	var existingConfig database.NotifyConfig
+	err := database.DB.Where("is_active = ?", true).First(&existingConfig).Error
+
+	if err != nil {
+		// No active config exists, create a new one
+		config := database.NotifyConfig{
+			TGToken:  body.Token,
+			TGChatID: body.ChatID,
+			IsActive: true,
+		}
+		if err := database.DB.Create(&config).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create telegram config"})
+			return
+		}
+		c.JSON(http.StatusCreated, gin.H{
+			"message": "Telegram settings saved successfully",
+			"config":  config,
+		})
+	} else {
+		// Update existing config
+		updateData := map[string]interface{}{
+			"tg_token":   body.Token,
+			"tg_chat_id": body.ChatID,
+			"is_active":  true,
+		}
+		if err := database.DB.Model(&existingConfig).Updates(updateData).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update telegram config"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"message": "Telegram settings updated successfully",
+			"config":  existingConfig,
+		})
+	}
+}
+
+// handleTestTelegramConnection tests the Telegram bot connection by sending a test message
+func handleTestTelegramConnection(c *gin.Context) {
+	if database.DB == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not initialized"})
+		return
+	}
+
+	id := c.Param("id")
+	if id == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "config ID is required"})
+		return
+	}
+
+	var config database.NotifyConfig
+	if err := database.DB.First(&config, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "telegram config not found"})
+		return
+	}
+
+	// Send test message
+	testMessage := "Hello from ZenStack"
+	if err := notify.SendTelegramMessage(config.TGToken, config.TGChatID, testMessage); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "failed to send test message",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Test message sent successfully",
+		"chat_id": config.TGChatID,
+	})
 }
