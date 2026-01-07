@@ -11,7 +11,7 @@
 -   **✨ Golden Paths (Scaffolding):** Spin up production-ready microservices in seconds with pre-configured CI/CD, monitoring, and security best practices.
 -   **🤖 AI-Powered Ops:** Built-in LLM integration to diagnose deployment failures and provide root-cause analysis from logs.
 
-## 🛠 Tech Stack
+## 🛠 技术栈 (Tech Stack)
 
 -   **Backend:** Go 1.25+ (High-performance core engine)
 -   **Portal:** Backstage (React/TypeScript)
@@ -50,3 +50,4 @@ docker-compose up -d
 
 # 3. Access the dashboard
 # Open your browser and navigate to http://localhost:3000
+
