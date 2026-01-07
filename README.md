@@ -40,7 +40,9 @@ docker-compose up -d
 ## 🤝 Contributing
 We welcome contributions! Please check our [CONTRIBUTING.md](CONTRIBUTING.md).
 
+
 ## 📄 License
 This project is licensed under the Apache License 2.0.
+
 
 
