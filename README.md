@@ -31,25 +31,22 @@
 ├── templates/          # Service scaffolding templates
 └── deploy/             # Kubernetes Helm charts & Docker Compose
 
-🚦 Quick Start
-Prerequisites
-Docker & Docker Compose
+## 🚦 Quick Start
 
-A Kubernetes cluster (optional, for Infra features)
+### Prerequisites
+- **Docker & Docker Compose**
+- **Go 1.25+** (for local development)
+- **A Kubernetes cluster** (optional, required for Infrastructure features)
 
-Run Locally
-Bash
+### Run Locally
 
-# Clone the repository
+```bash
+# 1. Clone the repository
 git clone [https://github.com/harveywai/zenstack.git](https://github.com/harveywai/zenstack.git)
 cd zenstack
 
-# Start the platform
+# 2. Start the platform services (PostgreSQL, Engine, UI)
 docker-compose up -d
 
-# Access the dashboard at http://localhost:3000
-🤝 Contributing
-We welcome contributions! Whether it's a new cloud provider, a bug fix, or a feature request, please check our CONTRIBUTING.md.
-
-📄 License
-This project is licensed under the Apache License 2.0 - see the LICENSE file for details.
+# 3. Access the dashboard
+# Open your browser and navigate to http://localhost:3000
