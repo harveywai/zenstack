@@ -9,6 +9,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"strings"
 	"sync"
@@ -112,6 +113,12 @@ func main() {
 		v1Admin.POST("/users/:id/reject", handleRejectUser)
 		v1Admin.GET("/dashboard/stats", handleDashboardStats)
 
+		// Admin domain management routes
+		v1Admin.PATCH("/domains/:id", handleUpdateDomain)
+		v1Admin.PUT("/domains/:id", handleUpdateDomain) // Support PUT for compatibility
+		v1Admin.GET("/domains/:id/heartbeats", handleGetDomainHeartbeats)
+		v1Admin.DELETE("/domains/:id", handleDeleteDomain)
+
 		// Notification configuration endpoints
 		v1Admin.GET("/notifications/configs", handleListNotificationConfigs)
 		v1Admin.POST("/notifications/configs", handleCreateNotificationConfig)
@@ -157,6 +164,7 @@ func handleDashboard(c *gin.Context) {
 	// HTML uses Tailwind CSS via CDN and a small amount of JavaScript
 	// to call the backend APIs and render results in the browser.
 	const html = `<!DOCTYPE html>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <html lang="en">
 <head>
     <meta charset="UTF-8" />
@@ -164,6 +172,45 @@ func handleDashboard(c *gin.Context) {
     <title>ZenStack - Internal Developer Platform</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
+        .uptime-square {
+            width: 10px;
+            height: 25px;
+            margin: 2px;
+            border-radius: 2px;
+        }
+        .detail-row {
+            transition: all 0.3s ease-in-out;
+        }
+        .detail-row-enter {
+            animation: slideDown 0.3s ease-out;
+        }
+        .detail-row-exit {
+            animation: slideUp 0.3s ease-in;
+        }
+        @keyframes slideDown {
+            from {
+                opacity: 0;
+                transform: translateY(-10px);
+                max-height: 0;
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+                max-height: 1000px;
+            }
+        }
+        @keyframes slideUp {
+            from {
+                opacity: 1;
+                transform: translateY(0);
+                max-height: 1000px;
+            }
+            to {
+                opacity: 0;
+                transform: translateY(-10px);
+                max-height: 0;
+            }
+        }
         @keyframes pulse-red {
             0%, 100% {
                 background-color: rgba(239, 68, 68, 0.1);
@@ -237,69 +284,115 @@ func handleDashboard(c *gin.Context) {
             background-color: rgb(234, 179, 8);
             animation: breathe-yellow 2s ease-in-out infinite;
         }
+        /* Sidebar tooltip styles */
+        [data-tooltip] {
+            position: relative;
+        }
+        [data-tooltip]:hover::after {
+            content: attr(data-tooltip);
+            position: absolute;
+            left: 100%;
+            top: 50%;
+            transform: translateY(-50%);
+            margin-left: 8px;
+            padding: 4px 8px;
+            background-color: rgba(15, 23, 42, 0.95);
+            color: rgb(241, 245, 249);
+            border: 1px solid rgb(51, 65, 85);
+            border-radius: 4px;
+            font-size: 11px;
+            white-space: nowrap;
+            z-index: 1000;
+            pointer-events: none;
+        }
+        /* Refresh icon rotation animation */
+        @keyframes spin {
+            from {
+                transform: rotate(0deg);
+            }
+            to {
+                transform: rotate(360deg);
+            }
+        }
+        .animate-spin {
+            animation: spin 1s linear infinite;
+        }
     </style>
 </head>
 <body class="min-h-screen bg-slate-950 text-slate-100">
     <div class="min-h-screen flex bg-slate-950 text-slate-100">
         <!-- Sidebar Navigation -->
-        <aside class="w-60 border-r border-slate-800 bg-slate-950/95 flex flex-col">
+        <aside id="sidebar" class="w-60 border-r border-slate-800 bg-slate-950/95 flex flex-col transition-all duration-300">
             <div class="px-4 py-4 border-b border-slate-800 flex items-center gap-3">
-                <div class="h-9 w-9 rounded-xl bg-emerald-500 flex items-center justify-center text-slate-950 font-black">
-                    Z
-                </div>
-                <div>
-                    <p class="text-sm font-semibold tracking-tight">ZenStack</p>
-                    <p class="text-[11px] text-slate-400">Internal Developer Platform</p>
+                <button id="sidebar-toggle" class="p-1 rounded hover:bg-slate-800/60 transition-colors" title="Toggle Sidebar">
+                    <svg class="w-5 h-5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"></path>
+                    </svg>
+                </button>
+                <div id="sidebar-brand" class="flex items-center gap-3">
+                    <div class="h-9 w-9 rounded-xl bg-emerald-500 flex items-center justify-center text-slate-950 font-black">
+                        Z
+                    </div>
+                    <div id="sidebar-text">
+                        <p class="text-sm font-semibold tracking-tight">ZenStack</p>
+                        <p class="text-[11px] text-slate-400">Internal Developer Platform</p>
+                    </div>
                 </div>
             </div>
-            <nav class="flex-1 px-3 py-4 space-y-1 text-sm">
+            <nav id="sidebar-nav" class="flex-1 px-3 py-4 space-y-1 text-sm">
                 <button
                     id="nav-dashboard"
                     data-view="dashboard"
-                    class="w-full flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-800 text-slate-50 font-medium"
+                    class="w-full flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-800 text-slate-50 font-medium group relative"
+                    title="Dashboard"
                 >
                     <span class="h-2 w-2 rounded-full bg-purple-400"></span>
-                    Dashboard
+                    <span class="nav-text">Dashboard</span>
                 </button>
                 <button
                     id="nav-assets"
                     data-view="assets"
-                    class="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-slate-300 hover:bg-slate-800/60"
+                    class="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-slate-300 hover:bg-slate-800/60 group relative"
+                    title="Assets"
                 >
                     <span class="h-2 w-2 rounded-full bg-emerald-400"></span>
-                    Assets
+                    <span class="nav-text">Assets</span>
                 </button>
                 <button
                     id="nav-catalog"
                     data-view="catalog"
-                    class="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-slate-300 hover:bg-slate-800/60"
+                    class="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-slate-300 hover:bg-slate-800/60 group relative"
+                    title="Catalog"
                 >
                     <span class="h-2 w-2 rounded-full bg-sky-400"></span>
-                    Catalog
+                    <span class="nav-text">Catalog</span>
                 </button>
                 <button
                     id="nav-infra"
                     data-view="infra"
-                    class="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-slate-300 hover:bg-slate-800/60"
+                    class="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-slate-300 hover:bg-slate-800/60 group relative"
+                    title="Infrastructure"
                 >
                     <span class="h-2 w-2 rounded-full bg-amber-400"></span>
-                    Infrastructure
+                    <span class="nav-text">Infrastructure</span>
                 </button>
                 <button
                     id="nav-users"
                     data-view="users"
-                    class="hidden w-full flex items-center gap-2 px-3 py-2 rounded-lg text-slate-300 hover:bg-slate-800/60"
+                    class="hidden w-full flex items-center gap-2 px-3 py-2 rounded-lg text-slate-300 hover:bg-slate-800/60 group relative"
+                    title="User Management"
                 >
                     <span class="h-2 w-2 rounded-full bg-rose-400"></span>
-                    User Management
+                    <span class="nav-text">User Management</span>
                 </button>
                 <button
                     id="nav-notifications"
                     data-view="notifications"
-                    class="hidden w-full flex items-center gap-2 px-3 py-2 rounded-lg text-slate-300 hover:bg-slate-800/60"
+                    class="hidden w-full flex items-center gap-2 px-3 py-2 rounded-lg text-slate-300 hover:bg-slate-800/60 group relative"
+                    title="Notifications"
                 >
                     <span class="h-2 w-2 rounded-full bg-indigo-400"></span>
-                    Notifications
+                    <span class="nav-text">Notifications</span>
                 </button>
             </nav>
             <div class="px-4 py-3 border-t border-slate-800 text-[11px] text-slate-500 space-y-1">
@@ -332,7 +425,28 @@ func handleDashboard(c *gin.Context) {
                             <span class="h-2 w-2 rounded-full bg-emerald-400 animate-pulse"></span>
                             Control Plane Ready
                         </span>
+                        <span class="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-slate-800/60 border border-slate-700/60">
+                            <svg class="h-3 w-3 text-sky-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"></path>
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"></path>
+                            </svg>
+                            Primary Node: Japan-Nagoya
+                        </span>
                     </div>
+                </div>
+                <!-- Global "Last Updated" Indicator -->
+                <div class="max-w-6xl mx-auto px-4 pb-2 flex items-center justify-between text-[10px] text-slate-500">
+                    <span id="last-updated-time">Last updated at: --:--:--</span>
+                    <button
+                        id="manual-refresh-btn"
+                        class="inline-flex items-center gap-1 px-2 py-1 rounded border border-slate-700 hover:bg-slate-800/60 transition-colors"
+                        title="Manual Refresh"
+                    >
+                        <svg id="refresh-icon" class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+                        </svg>
+                        <span>Refresh</span>
+                    </button>
                 </div>
             </header>
 
@@ -585,12 +699,14 @@ func handleDashboard(c *gin.Context) {
                                             <th class="px-3 py-2 text-left text-xs font-semibold text-slate-400">Days Remaining</th>
                                             <th class="px-3 py-2 text-left text-xs font-semibold text-slate-400">Last Check</th>
                                             <th class="px-3 py-2 text-left text-xs font-semibold text-slate-400">Auto-Renew</th>
+                                            <th class="px-3 py-2 text-left text-xs font-semibold text-slate-400">Tags</th>
+                                            <th class="px-3 py-2 text-left text-xs font-semibold text-slate-400">Custom Status</th>
                                             <th class="px-3 py-2 text-left text-xs font-semibold text-slate-400">Actions</th>
                                         </tr>
                                     </thead>
                                     <tbody id="domains-body" class="divide-y divide-slate-900/80">
                                         <tr>
-                                            <td colspan="8" class="px-3 py-6 text-center text-xs text-slate-500">
+                                            <td colspan="10" class="px-3 py-6 text-center text-xs text-slate-500">
                                                 Loading domains...
                                             </td>
                                         </tr>
@@ -787,7 +903,7 @@ func handleDashboard(c *gin.Context) {
                         </section>
                     </section>
 
-                        <!-- User Management View: Admin only -->
+    <!-- User Management View: Admin only -->
                         <section id="view-users" class="space-y-6 hidden">
                             <div id="user-management-section" class="space-y-6">
                                 <section class="bg-slate-900/60 border border-slate-800 rounded-2xl shadow-xl shadow-slate-950/40 p-6 space-y-3">
@@ -1044,6 +1160,46 @@ func handleDashboard(c *gin.Context) {
             </footer>
         </div>
     </div>
+    <!-- Delete Monitor Modal -->
+    <div
+        id="delete-monitor-modal"
+        class="fixed inset-0 hidden z-40 items-center justify-center bg-slate-950/70 backdrop-blur-sm"
+        aria-hidden="true"
+    >
+        <div class="w-full max-w-sm rounded-2xl border border-slate-800 bg-slate-900 shadow-xl shadow-slate-900/80 p-6 space-y-4">
+            <div class="flex items-start justify-between gap-4">
+                <div>
+                    <h2 class="text-sm font-semibold tracking-tight text-slate-100">Delete Monitor?</h2>
+                    <p id="delete-monitor-message" class="mt-2 text-sm text-slate-300">
+                        Are you sure you want to delete this monitor? This action will permanently remove all heartbeat history and cannot be undone.
+                    </p>
+                </div>
+                <button
+                    id="delete-monitor-close"
+                    class="text-slate-400 hover:text-slate-100 text-lg leading-none"
+                    aria-label="Close delete confirmation"
+                >
+                    &times;
+                </button>
+            </div>
+            <div class="mt-4 flex justify-end gap-2">
+                <button
+                    id="delete-monitor-cancel"
+                    class="px-3 py-1.5 rounded-lg border border-slate-700 text-xs text-slate-200 hover:bg-slate-800/80"
+                    type="button"
+                >
+                    Cancel
+                </button>
+                <button
+                    id="delete-monitor-confirm"
+                    class="px-3 py-1.5 rounded-lg bg-rose-600 text-xs text-white hover:bg-rose-500 disabled:opacity-60 disabled:cursor-not-allowed"
+                    type="button"
+                >
+                    Confirm Delete
+                </button>
+            </div>
+        </div>
+    </div>
 
     <!-- Login Overlay -->
     <div
@@ -1110,7 +1266,7 @@ func handleDashboard(c *gin.Context) {
                     class="text-slate-400 hover:text-slate-100 text-xs"
                     aria-label="Close modal"
                 >
-                    ✕
+                    &times;
                 </button>
             </div>
 
@@ -1220,7 +1376,7 @@ func handleDashboard(c *gin.Context) {
                     class="text-slate-400 hover:text-slate-100 text-xs"
                     aria-label="Close modal"
                 >
-                    ✕
+                    &times;
                 </button>
             </div>
             <form id="add-user-form" class="space-y-3">
@@ -1300,7 +1456,7 @@ func handleDashboard(c *gin.Context) {
                     class="text-slate-400 hover:text-slate-100 text-xs"
                     aria-label="Close modal"
                 >
-                    ✕
+                    &times;
                 </button>
             </div>
             <form id="add-notification-config-form" class="space-y-3">
@@ -1394,7 +1550,7 @@ func handleDashboard(c *gin.Context) {
                     class="text-slate-400 hover:text-slate-100 text-xs"
                     aria-label="Close modal"
                 >
-                    ✕
+                    &times;
                 </button>
             </div>
             <form id="add-telegram-config-form" class="space-y-3">
@@ -1473,7 +1629,7 @@ func handleDashboard(c *gin.Context) {
                     class="text-slate-400 hover:text-slate-100 text-xs"
                     aria-label="Close modal"
                 >
-                    ✕
+                    &times;
                 </button>
             </div>
             <form id="add-template-form" class="space-y-3">
@@ -1537,6 +1693,12 @@ func handleDashboard(c *gin.Context) {
         </div>
     </div>
 
+    <!-- Global Toast -->
+    <div
+        id="global-toast"
+        class="fixed bottom-4 right-4 z-50 hidden rounded-lg bg-emerald-600 text-white px-4 py-2 text-sm shadow-lg"
+    ></div>
+
     <!-- Swagger UI Modal -->
     <div
         id="swagger-modal"
@@ -1554,7 +1716,7 @@ func handleDashboard(c *gin.Context) {
                     class="text-slate-400 hover:text-slate-100 text-xs"
                     aria-label="Close Swagger modal"
                 >
-                    ✕
+                    &times;
                 </button>
             </div>
             <div id="swagger-container" class="flex-1 overflow-hidden bg-slate-950">
@@ -1566,6 +1728,11 @@ func handleDashboard(c *gin.Context) {
     <script src="https://unpkg.com/swagger-ui-dist/swagger-ui-bundle.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <script>
+        // Global Chart Registry to prevent "Canvas is already in use" errors
+        const chartInstances = {};
+        let currentDeleteDomainId = null;
+        let currentDeleteDomainName = "";
+        
         // Global error handler to prevent JS errors from blocking login
         window.onerror = function(msg) {
             console.log("Caught Error: " + msg);
@@ -1603,6 +1770,27 @@ func handleDashboard(c *gin.Context) {
                 localStorage.removeItem("token");
                 localStorage.removeItem("user");
             } catch (_) {}
+        }
+
+        // Global Toast helper
+        function showToast(message, type) {
+            const toast = document.getElementById("global-toast");
+            if (!toast) return;
+            // Base styles
+            let baseClass = "fixed bottom-4 right-4 z-50 rounded-lg px-4 py-2 text-sm shadow-lg ";
+            let colorClass = "bg-emerald-600 text-white";
+            if (type === "error") {
+                colorClass = "bg-rose-600 text-white";
+            } else if (type === "info") {
+                colorClass = "bg-slate-700 text-slate-50";
+            }
+            toast.className = baseClass + colorClass;
+            toast.textContent = message || "";
+            toast.classList.remove("hidden");
+            // Auto-hide after 3 seconds
+            setTimeout(() => {
+                toast.classList.add("hidden");
+            }, 3000);
         }
 
         function authHeaders(extra) {
@@ -1803,19 +1991,39 @@ func handleDashboard(c *gin.Context) {
                 const domains = await resp.json();
 
                 if (!domains || domains.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="8" class="px-3 py-6 text-center text-xs text-slate-500">No domains in database. Run a scan to add domains.</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="10" class="px-3 py-6 text-center text-xs text-slate-500">No domains in database. Run a scan to add domains.</td></tr>';
                     return;
                 }
 
                 tbody.innerHTML = "";
                 for (const domain of domains) {
                     const tr = document.createElement("tr");
+                    // Ensure we use the numeric database ID (domain.id or domain.ID) for unique identification
+                    // Fallback to domain_name only if numeric ID is not available
+                    const domainId = domain.id || domain.ID || domain.domain_name || "";
+                    const domainName = domain.domain_name || domain.DomainName || "";
+                    // Store numeric ID separately for reliable access
+                    const numericId = domain.id || domain.ID || null;
+                    tr.dataset.domainId = domainId;
+                    tr.dataset.id = numericId || domainId; // Store numeric ID for modal
+                    tr.dataset.numericId = numericId || ""; // Explicit numeric ID storage
+                    tr.dataset.domainName = domainName;
+                    tr.style.cursor = "pointer";
                     // Add pulse animation for Critical domains
                     if (domain.ssl_status === "Critical") {
                         tr.className = "hover:bg-slate-900/80 transition pulse-critical bg-red-500/10 border-l-4 border-red-500";
                     } else {
                         tr.className = "hover:bg-slate-900/80 transition";
                     }
+                    
+                    // Add click handler for expandable row
+                    tr.addEventListener("click", function(e) {
+                        // Don't expand if clicking on buttons or interactive elements
+                        if (e.target.tagName === "BUTTON" || e.target.closest("button") || e.target.closest("label") || e.target.closest("input")) {
+                            return;
+                        }
+                        toggleDomainDetail(domainId);
+                    });
 
                     // Domain name with live indicator
                     const domainCell = document.createElement("td");
@@ -1886,14 +2094,33 @@ func handleDashboard(c *gin.Context) {
                     sslBadge.textContent = currentSSLStatus;
                     sslStatusCell.appendChild(sslBadge);
 
-                    // SSL Expiry
+                    // SSL Expiry - Use real database field, not mock data
                     const sslExpiryCell = document.createElement("td");
                     sslExpiryCell.className = "px-3 py-2 text-xs text-slate-200";
-                    if (domain.ssl_expiry) {
-                        const dt = new Date(domain.ssl_expiry);
-                        sslExpiryCell.textContent = dt.toLocaleString();
+                    // SSL Date Cleanup: if ssl_expiry starts with '0001', return 'Scanning...'
+                    if (domain.ssl_expiry && typeof domain.ssl_expiry === "string") {
+                        const d = String(domain.ssl_expiry);
+                        if (d.startsWith("0001")) {
+                            sslExpiryCell.textContent = "Scanning...";
+                            sslExpiryCell.className = "px-3 py-2 text-xs text-slate-400 italic";
+                        } else if (d !== "0001-01-01T00:00:00Z" && 
+                                   d !== "1970-01-01T00:00:00Z" && 
+                                   d !== "") {
+                            const dt = new Date(domain.ssl_expiry);
+                            // Check if date is valid (not NaN) and year >= 2000 (not a zero/invalid date)
+                            if (!isNaN(dt.getTime()) && dt.getFullYear() >= 2000) {
+                                sslExpiryCell.textContent = dt.toLocaleString();
+                            } else {
+                                sslExpiryCell.textContent = "Scanning...";
+                                sslExpiryCell.className = "px-3 py-2 text-xs text-slate-400 italic";
+                            }
+                        } else {
+                            sslExpiryCell.textContent = "Scanning...";
+                            sslExpiryCell.className = "px-3 py-2 text-xs text-slate-400 italic";
+                        }
                     } else {
-                        sslExpiryCell.textContent = "-";
+                        sslExpiryCell.textContent = "Scanning...";
+                        sslExpiryCell.className = "px-3 py-2 text-xs text-slate-400 italic";
                     }
 
                     // Days Remaining
@@ -1936,7 +2163,7 @@ func handleDashboard(c *gin.Context) {
                     checkbox.checked = domain.auto_renew || false;
                     checkbox.addEventListener("change", async function() {
                         try {
-                            const resp = await apiFetch("/v1/domains/" + domain.id + "/auto-renew", {
+                            const resp = await apiFetch("/v1/domains/" + domainId + "/auto-renew", {
                                 method: "PUT",
                                 headers: {
                                     "Content-Type": "application/json",
@@ -1959,16 +2186,115 @@ func handleDashboard(c *gin.Context) {
                     toggle.appendChild(slider);
                     autoRenewCell.appendChild(toggle);
 
+                    // Tags Cell (editable)
+                    const tagsCell = document.createElement("td");
+                    tagsCell.className = "px-3 py-2 text-xs";
+                    tagsCell.dataset.domainId = domainId;
+                    tagsCell.dataset.field = "tags";
+                    const tagsContainer = document.createElement("div");
+                    tagsContainer.className = "flex flex-wrap gap-1 items-center";
+                    const tags = (domain.tags || "").split(",").filter(t => t.trim() !== "");
+                    if (tags.length === 0) {
+                        const emptyTag = document.createElement("span");
+                        emptyTag.className = "text-slate-500 italic cursor-pointer hover:text-slate-300";
+                        emptyTag.textContent = "Click to add tags";
+                        emptyTag.addEventListener("click", function() { openEditModal(domainId, "tags", ""); });
+                        tagsContainer.appendChild(emptyTag);
+                    } else {
+                        tags.forEach(tag => {
+                            const tagBadge = document.createElement("span");
+                            tagBadge.className = "inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium bg-sky-500/20 text-sky-300 border border-sky-500/40";
+                            tagBadge.textContent = tag.trim();
+                            tagsContainer.appendChild(tagBadge);
+                        });
+                        const editIcon = document.createElement("span");
+                        editIcon.className = "ml-1 text-slate-400 hover:text-slate-200 cursor-pointer";
+                        editIcon.innerHTML = "✎";
+                        editIcon.title = "Edit tags";
+                        editIcon.addEventListener("click", function() { openEditModal(domainId, "tags", domain.tags || ""); });
+                        tagsContainer.appendChild(editIcon);
+                    }
+                    tagsCell.appendChild(tagsContainer);
+
+                    // Custom Status Cell (editable)
+                    const customStatusCell = document.createElement("td");
+                    customStatusCell.className = "px-3 py-2 text-xs";
+                    customStatusCell.dataset.domainId = domainId;
+                    customStatusCell.dataset.field = "custom_status";
+                    const customStatus = domain.custom_status || "";
+                    if (!customStatus) {
+                        const emptyStatus = document.createElement("span");
+                        emptyStatus.className = "text-slate-500 italic cursor-pointer hover:text-slate-300";
+                        emptyStatus.textContent = "Click to set";
+                        emptyStatus.addEventListener("click", function() { openEditModal(domainId, "custom_status", ""); });
+                        customStatusCell.appendChild(emptyStatus);
+                    } else {
+                        const statusContainer = document.createElement("div");
+                        statusContainer.className = "flex items-center gap-1";
+                        const statusBadge = document.createElement("span");
+                        // Color code based on status
+                        if (customStatus.toLowerCase().includes("production")) {
+                            statusBadge.className = "inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium bg-emerald-500/20 text-emerald-300 border border-emerald-500/40";
+                        } else if (customStatus.toLowerCase().includes("testing") || customStatus.toLowerCase().includes("test")) {
+                            statusBadge.className = "inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium bg-amber-500/20 text-amber-300 border border-amber-500/40";
+                        } else if (customStatus.toLowerCase().includes("pending")) {
+                            statusBadge.className = "inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium bg-sky-500/20 text-sky-300 border border-sky-500/40";
+                        } else {
+                            statusBadge.className = "inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium bg-slate-500/20 text-slate-300 border border-slate-500/40";
+                        }
+                        statusBadge.textContent = customStatus;
+                        statusContainer.appendChild(statusBadge);
+                        const editIcon = document.createElement("span");
+                        editIcon.className = "text-slate-400 hover:text-slate-200 cursor-pointer";
+                        editIcon.innerHTML = "✎";
+                        editIcon.title = "Edit status";
+                        editIcon.addEventListener("click", function() { openEditModal(domainId, "custom_status", customStatus); });
+                        statusContainer.appendChild(editIcon);
+                        customStatusCell.appendChild(statusContainer);
+                    }
+
                     // Actions
                     const actionsCell = document.createElement("td");
                     actionsCell.className = "px-3 py-2 text-xs";
+                    const actionsContainer = document.createElement("div");
+                    actionsContainer.className = "flex items-center gap-1";
+
+                    // Edit button
+                    const editBtn = document.createElement("button");
+                    editBtn.className = "inline-flex items-center gap-1 rounded-lg border border-slate-700 px-2 py-1 text-[10px] text-slate-200 hover:bg-slate-800/80";
+                    editBtn.textContent = "Edit";
+                    // Ensure we use the numeric database ID (domain.id or domain.ID) for the edit modal
+                    // Lock the numeric ID at button creation time to ensure consistency
+                    const currentEditingId = domain.id || domain.ID || null;
+                    if (!currentEditingId || isNaN(currentEditingId)) {
+                        console.warn("Domain missing numeric ID:", domain);
+                    }
+                    editBtn.addEventListener("click", function(e) {
+                        e.stopPropagation(); // Prevent row expansion when clicking Edit button
+                        // Force use numeric ID from domain object - domain.ID is the primary source
+                        const numericId = domain.id || domain.ID;
+                        console.log("Edit button clicked - domain object:", domain);
+                        console.log("Edit button clicked - using domain.ID:", numericId, "(type:", typeof numericId + ")");
+                        // Ensure currentEditingId is set to the numeric ID - must be a number
+                        if (numericId && !isNaN(numericId)) {
+                            // Store in a global variable for saveDomainChanges to access
+                            window.currentEditingId = numericId;
+                            openEditModal(String(numericId), "both", { tags: domain.tags || "", custom_status: domain.custom_status || "" });
+                        } else {
+                            console.error("Invalid domain ID for edit:", numericId, "from domain:", domain);
+                            alert("Error: Invalid domain ID. Please refresh the page.");
+                        }
+                    });
+                    actionsContainer.appendChild(editBtn);
+
+                    // Renew button
                     const renewBtn = document.createElement("button");
                     renewBtn.className = "inline-flex items-center gap-1 rounded-lg border border-slate-700 px-2 py-1 text-[10px] text-slate-200 hover:bg-slate-800/80";
                     renewBtn.textContent = "Renew";
                     renewBtn.addEventListener("click", async function() {
-                        if (!confirm("Manually renew domain " + domain.domain_name + "?")) return;
+                        if (!confirm("Manually renew domain " + domainName + "?")) return;
                         try {
-                            const resp = await apiFetch("/v1/domains/" + domain.id + "/renew", {
+                            const resp = await apiFetch("/v1/domains/" + domainId + "/renew", {
                                 method: "POST",
                                 headers: { "Accept": "application/json" },
                             });
@@ -1978,7 +2304,26 @@ func handleDashboard(c *gin.Context) {
                             alert("Error initiating renewal: " + err.message);
                         }
                     });
-                    actionsCell.appendChild(renewBtn);
+                    actionsContainer.appendChild(renewBtn);
+
+                    // Delete monitor button
+                    const deleteBtn = document.createElement("button");
+                    deleteBtn.className = "inline-flex items-center justify-center rounded-lg p-1 text-rose-500 hover:text-rose-300 hover:bg-rose-500/10 transition-colors";
+                    deleteBtn.innerHTML = '<svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5-4h4a2 2 0 012 2v1H8V5a2 2 0 012-2z" /></svg>';
+                    deleteBtn.title = "Delete Monitor";
+                    deleteBtn.addEventListener("click", function(e) {
+                        e.stopPropagation(); // Prevent row expansion when clicking Delete button
+                        const numericId = domain.id || domain.ID;
+                        if (!numericId || isNaN(numericId)) {
+                            console.error("Invalid domain ID for delete:", numericId, "from domain:", domain);
+                            alert("Error: Invalid domain ID. Please refresh the page.");
+                            return;
+                        }
+                        openDeleteMonitorModal(numericId, domainName);
+                    });
+                    actionsContainer.appendChild(deleteBtn);
+
+                    actionsCell.appendChild(actionsContainer);
 
                     tr.appendChild(domainCell);
                     tr.appendChild(liveStatusCell);
@@ -1987,14 +2332,982 @@ func handleDashboard(c *gin.Context) {
                     tr.appendChild(daysCell);
                     tr.appendChild(lastCheckCell);
                     tr.appendChild(autoRenewCell);
+                    tr.appendChild(tagsCell);
+                    tr.appendChild(customStatusCell);
                     tr.appendChild(actionsCell);
 
                     tbody.appendChild(tr);
                 }
             } catch (err) {
                 console.error("Error loading domains:", err);
-                tbody.innerHTML = '<tr><td colspan="8" class="px-3 py-6 text-center text-xs text-red-400">Error loading domains: ' + (err.message || "Unknown error") + "</td></tr>";
+                tbody.innerHTML = '<tr><td colspan="10" class="px-3 py-6 text-center text-xs text-red-400">Error loading domains: ' + (err.message || "Unknown error") + "</td></tr>";
             }
+        }
+
+        // Toggle domain details row (expandable row)
+        // Nuclear Fix: always ensure DOM containers exist *before* fetching data or attempting to render charts.
+        function toggleDomainDetail(domainId) {
+            const tbody = document.getElementById("domains-body");
+            if (!tbody) return;
+            
+            // Find the base row for this domain
+            const row = tbody.querySelector('tr[data-domain-id="' + domainId + '"]');
+            if (!row) return;
+
+            // Resolve the numeric database ID first and use it consistently everywhere (detail row IDs, canvas IDs, fetch IDs)
+            const resolvedId = row.dataset.numericId || row.dataset.id || domainId;
+            const detailRowId = "detail-" + resolvedId;
+
+            // Step 1: If detail row already exists, just toggle visibility with animation (no re-fetch / re-insert)
+            const existingDetails = document.getElementById(detailRowId);
+            if (existingDetails) {
+                if (existingDetails.style.display === "none") {
+                    existingDetails.style.display = "";
+                    existingDetails.classList.add("detail-row-enter");
+                    trackExpandedDomain(resolvedId); // Track expanded domain for auto-refresh
+                    setTimeout(() => {
+                        existingDetails.classList.remove("detail-row-enter");
+                    }, 300);
+                } else {
+                    existingDetails.classList.add("detail-row-exit");
+                    untrackExpandedDomain(resolvedId); // Untrack when collapsed
+                    setTimeout(() => {
+                        existingDetails.style.display = "none";
+                        existingDetails.classList.remove("detail-row-exit");
+                    }, 300);
+                }
+                return;
+            }
+
+            // Step 2: Detail row does NOT exist -> create it immediately (no timeouts before insertion)
+            console.log("Creating detail row with ID:", resolvedId, "for domain:", domainId);
+
+            // Remove any legacy detail rows for this domain (safety)
+            const legacyDetails = tbody.querySelector('tr[data-details-for="' + resolvedId + '"]');
+            if (legacyDetails) {
+                legacyDetails.remove();
+            }
+
+            // Hard-coded, minimal template for monitoring charts (no race with later rewrites)
+            // Restore Uptime Bar: Compact layout with Uptime History on first row, charts on second row
+            // First row: Uptime History (50 green squares)
+            // Second row: Two charts side by side (Response Latency and Time Breakdown)
+            const detailRowHTML =
+                '<tr id="' + detailRowId + '" class="detail-row detail-row-enter" data-details-for="' + resolvedId + '">' +
+                    '<td colspan="10" class="bg-slate-900/80">' +
+                        '<div class="py-8 px-6 bg-slate-900/50 border-b border-slate-800 space-y-8" style="clear: both; display: block;">' +
+                            // Top row: Uptime History (full width)
+                            '<section>' +
+                                '<h4 class="text-sm font-semibold text-slate-400 mb-4">Uptime History (Last 50 Checks)</h4>' +
+                                '<div id="uptimeBar-' + resolvedId + '" class="flex gap-1.5 h-8 flex-wrap mb-12"></div>' +
+                                '<div id="uptimePercent-' + resolvedId + '" class="text-xs text-slate-500 mt-2"></div>' +
+                            '</section>' +
+                            // Second row: charts in responsive two-column grid
+                            '<div class="grid grid-cols-1 lg:grid-cols-2 gap-12">' +
+                                '<section>' +
+                                    '<h4 class="text-sm font-semibold text-slate-400 mb-4 mt-4">Response Latency (ms)</h4>' +
+                                    '<div class="min-h-[300px] w-full">' +
+                                        '<canvas id="latencyChart-' + resolvedId + '"></canvas>' +
+                                    '</div>' +
+                                '</section>' +
+                                '<section>' +
+                                    '<h4 class="text-sm font-semibold text-slate-400 mb-4 mt-4">Response Time Breakdown</h4>' +
+                                    '<div class="min-h-[300px] w-full">' +
+                                        '<canvas id="breakdownChart-' + resolvedId + '"></canvas>' +
+                                    '</div>' +
+                                '</section>' +
+                            '</div>' +
+                        '</div>' +
+                    '</td>' +
+                '</tr>';
+
+            row.insertAdjacentHTML("afterend", detailRowHTML);
+
+            // Track expanded domain for auto-refresh
+            trackExpandedDomain(resolvedId);
+
+            // Clean up entry animation class after it plays
+            setTimeout(() => {
+                const detailRow = document.getElementById(detailRowId);
+                if (detailRow) {
+                    detailRow.classList.remove("detail-row-enter");
+                }
+            }, 300);
+
+            // Step 3: With containers guaranteed to exist, immediately fetch data.
+            // Chart rendering will use waitForContainers + requestAnimationFrame to ensure DOM is ready.
+            fetchHeartbeats(resolvedId);
+        }
+        
+        // Step 3: Fetch heartbeat data and render charts
+        async function fetchHeartbeats(domainId) {
+            try {
+                // Fetch heartbeat data
+                const resp = await apiFetch("/v1/admin/domains/" + domainId + "/heartbeats", {
+                    method: "GET",
+                    headers: { "Accept": "application/json" },
+                });
+                
+                if (!resp.ok) {
+                    throw new Error("Failed to load heartbeat data");
+                }
+                
+                const data = await resp.json();
+                
+                // Data verification: log heartbeat data to console
+                console.log("Heartbeat Data:", data);
+                console.log("Heartbeats 24h:", data.heartbeats_24h);
+                console.log("Recent 50:", data.recent_50);
+                
+                const heartbeats = data.heartbeats_24h || [];
+                const recent50 = data.recent_50 || [];
+                const uptimePercent = data.uptime_percent || 0;
+                
+                // Verify data structure
+                if (recent50.length > 0) {
+                    console.log("Sample heartbeat:", recent50[0]);
+                    console.log("Has latency:", recent50[0].latency !== undefined);
+                    console.log("Has status_code:", recent50[0].status_code !== undefined);
+                }
+                
+                // Use unified renderDomainCharts function (encapsulated in function scope)
+                // This ensures canvas exists before rendering
+                const canvasId = "latencyChart-" + domainId;
+                const canvas = document.getElementById(canvasId);
+                if (canvas) {
+                    await renderDomainCharts(domainId, data);
+                } else {
+                    console.warn("Canvas not found, cannot render charts:", canvasId);
+                    // Show error message in canvas container
+                    const parent = document.querySelector('canvas[id="' + canvasId + '"]')?.parentElement;
+                    if (parent) {
+                        parent.innerHTML = '<div class="flex items-center justify-center h-full text-xs text-slate-400 italic">Waiting for more data points...</div>';
+                    }
+                }
+                
+                // Render uptime bar (re-trigger bar rendering)
+                // Ensure Uptime Bar rendering logic is preserved in renderDomainCharts / fetchHeartbeats
+                const uptimeBarContainer = document.getElementById("uptimeBar-" + domainId);
+                const uptimePercentEl = document.getElementById("uptimePercent-" + domainId);
+                
+                if (uptimeBarContainer) {
+                    uptimeBarContainer.innerHTML = "";
+                    
+                    // Loop through last 50 data points: success (status 200) = bg-emerald-500, failure = bg-rose-500
+                    // Reverse to show oldest first (left to right)
+                    const reversed = [...recent50].reverse();
+                    for (const hb of reversed) {
+                        const isSuccess = hb.status_code >= 200 && hb.status_code < 400;
+                        // Use emerald-500 for success, rose-500 for failure (as specified)
+                        const color = isSuccess ? "bg-emerald-500" : "bg-rose-500";
+                        const timestamp = hb.created_at || hb.CreatedAt ? new Date(hb.created_at || hb.CreatedAt).toLocaleString() : "N/A";
+                        const statusCode = hb.status_code || hb.StatusCode || 0;
+                        const latency = hb.latency || hb.Latency || 0;
+                        const square = document.createElement("div");
+                        square.className = "uptime-square " + color;
+                        square.title = timestamp + " - Status: " + statusCode + " (" + latency + "ms)";
+                        uptimeBarContainer.appendChild(square);
+                    }
+                    
+                    // Display uptime percentage if available
+                    if (uptimePercent > 0) {
+                        const percentText = document.createElement("div");
+                        percentText.className = "text-xs text-slate-400 mt-2";
+                        percentText.textContent = "Uptime: " + uptimePercent.toFixed(1) + "%";
+                        uptimeBarContainer.appendChild(percentText);
+                    }
+                }
+                
+                if (uptimePercentEl) {
+                    uptimePercentEl.textContent = uptimePercent.toFixed(1) + "%";
+                }
+                
+                // Render charts with retry logic (line + breakdown) on the hard-coded canvases
+                renderUptimeChartWithRetry(domainId, heartbeats, recent50);
+            } catch (err) {
+                console.error("Error loading domain details:", err);
+                const detailsRow = document.querySelector('tr[data-details-for="' + domainId + '"]');
+                if (detailsRow) {
+                    const detailsCell = detailsRow.querySelector("td");
+                    if (detailsCell) {
+                        detailsCell.innerHTML = '<div class="text-xs text-red-400">Error loading details: ' + (err.message || "Unknown error") + "</div>";
+                    }
+                }
+            }
+        }
+        
+        // Render charts when the canvas is actually in the DOM (MutationObserver-based, deterministic)
+        function renderUptimeChartWithRetry(domainId, heartbeats, recent50) {
+            const targetId = "latencyChart-" + domainId;
+            console.log("Target ID:", targetId);
+
+            // Ensure Chart.js is loaded (this is the only place we "wait", not for DOM timing)
+            if (typeof Chart === "undefined") {
+                console.warn("Chart.js not loaded yet; will retry shortly for:", targetId);
+                setTimeout(() => renderUptimeChartWithRetry(domainId, heartbeats, recent50), 50);
+                return;
+            }
+
+            // If the canvas is already in the DOM, render immediately
+            const existing = document.getElementById(targetId);
+            if (existing) {
+                renderUptimeChart(domainId, heartbeats, recent50, existing);
+                return;
+            }
+
+            // Avoid stacking multiple observers per domain
+            if (!window.__zenstackChartObservers) window.__zenstackChartObservers = {};
+            if (window.__zenstackChartObservers[targetId]) {
+                console.log("Observer already active for:", targetId);
+                return;
+            }
+
+            // Observe DOM mutations until the canvas appears, then render and stop observing
+            const observer = new MutationObserver(() => {
+                const el = document.getElementById(targetId);
+                if (el) {
+                    console.log("Canvas detected in DOM:", targetId);
+                    observer.disconnect();
+                    delete window.__zenstackChartObservers[targetId];
+                    renderUptimeChart(domainId, heartbeats, recent50, el);
+                }
+            });
+
+            window.__zenstackChartObservers[targetId] = observer;
+            observer.observe(document.body, { childList: true, subtree: true });
+            console.log("MutationObserver armed for:", targetId);
+        }
+        
+        // Render Latency Line Chart (Last 24 Hours) - Uptime Kuma style
+        async function renderLatencyLineChart(domainId, heartbeats) {
+            if (!heartbeats || heartbeats.length === 0) {
+                console.warn("No heartbeat data to render latency chart");
+                return;
+            }
+            
+            const targetId = "latencyChart-" + domainId;
+            const canvas = document.getElementById(targetId);
+            
+            if (!canvas) {
+                console.warn("Latency chart container not found:", targetId);
+                return;
+            }
+            
+            // Data Source: Extract Latency and CreatedAt from heartbeats
+            // Support both snake_case (created_at) and camelCase (CreatedAt) from backend
+            const labels = heartbeats.map(hb => {
+                const createdAt = hb.CreatedAt || hb.created_at;
+                const d = new Date(createdAt);
+                // Time Formatting: Use toLocaleTimeString() for X-axis labels
+                return d.toLocaleTimeString();
+            });
+            
+            const latencyData = heartbeats.map(hb => {
+                const latency = hb.Latency || hb.latency;
+                return latency || 0;
+            });
+            
+            // Chart instance management: destroy existing instance before creating new one
+            const chartId = "latencyChart-" + domainId;
+            if (chartInstances[chartId]) {
+                chartInstances[chartId].destroy(); // Destroy old instance
+                delete chartInstances[chartId];
+            }
+            
+            // Create new Chart instance and store in registry
+            const registry = window.chartInstances || chartInstances;
+            registry[chartId] = new Chart(canvas, {
+                type: "line",
+                data: {
+                    labels: labels, // X-axis: timestamps
+                    datasets: [{
+                        label: "Total Latency (ms)",
+                        data: latencyData, // Y-axis: latency in milliseconds
+                        borderColor: "rgb(16, 185, 129)", // emerald-500 (green like Uptime Kuma)
+                        backgroundColor: "rgba(16, 185, 129, 0.1)", // green gradient
+                        borderWidth: 2,
+                        fill: true, // Enable fill for gradient effect
+                        tension: 0.4, // Smooth curve like Uptime Kuma
+                        pointRadius: 2,
+                        pointHoverRadius: 4,
+                    }],
+                },
+                options: {
+                    responsive: true, // Enable responsive behavior
+                    maintainAspectRatio: false, // Adapt to detail panel size
+                    plugins: {
+                        legend: {
+                            display: false,
+                        },
+                        tooltip: {
+                            mode: "index",
+                            intersect: false,
+                        },
+                    },
+                    scales: {
+                        x: {
+                            ticks: {
+                                color: "rgb(148, 163, 184)",
+                                font: { size: 9 },
+                                maxRotation: 45,
+                                minRotation: 45,
+                            },
+                            grid: {
+                                display: false,
+                            },
+                        },
+                        y: {
+                            beginAtZero: true,
+                            ticks: {
+                                color: "rgb(148, 163, 184)",
+                                font: { size: 10 },
+                            },
+                            grid: {
+                                color: "rgba(51, 65, 85, 0.3)",
+                            },
+                            title: {
+                                display: true,
+                                text: "Time (ms)",
+                                color: "rgb(148, 163, 184)",
+                                font: { size: 10 },
+                            },
+                        },
+                    },
+                },
+            });
+        }
+        
+        // Render uptime charts (line chart) - legacy function for backward compatibility
+        function renderUptimeChart(domainId, heartbeats, recent50, latencyChartCtx) {
+            if (!heartbeats || heartbeats.length === 0) {
+                console.warn("No heartbeat data to render charts");
+                return;
+            }
+            
+            // Use provided context or get it
+            if (!latencyChartCtx) {
+                const targetId = "latencyChart-" + domainId;
+                console.log("Target ID:", targetId);
+                latencyChartCtx = document.getElementById(targetId);
+            }
+            
+            // Render Response Latency Over Time (Line Chart) using latencyChart-${domainId}
+            if (latencyChartCtx) {
+                console.log("Chart container found for domain:", domainId);
+                const labels = heartbeats.map(hb => {
+                    const createdAt = hb.CreatedAt || hb.created_at;
+                    const d = new Date(createdAt);
+                    return d.toLocaleTimeString();
+                });
+            const latencyData = heartbeats.map(hb => {
+                const latency = hb.Latency || hb.latency;
+                return latency || 0;
+            });
+            
+            // Chart instance management: destroy existing instance before creating new one
+            // Fix Chart.js Instance Management: check window.chartInstances (or chartInstances) before creating
+            const chartId = "latencyChart-" + domainId;
+            if (window.chartInstances && window.chartInstances[chartId]) {
+                window.chartInstances[chartId].destroy(); // Destroy old instance
+                delete window.chartInstances[chartId];
+            } else if (chartInstances[chartId]) {
+                chartInstances[chartId].destroy(); // Destroy old instance
+                delete chartInstances[chartId];
+            }
+            
+            // Create new Chart instance and store in registry
+            const registry = window.chartInstances || chartInstances;
+            registry[chartId] = new Chart(latencyChartCtx, {
+                type: "line",
+                data: {
+                    labels: labels, // X-axis: timestamps
+                    datasets: [{
+                        label: "Total Latency (ms)",
+                        data: latencyData, // Y-axis: latency in milliseconds
+                        borderColor: "rgb(16, 185, 129)", // emerald-500 (green like Uptime Kuma)
+                        backgroundColor: "rgba(16, 185, 129, 0.1)", // green gradient
+                        borderWidth: 2,
+                        fill: true,
+                        tension: 0.4,
+                        pointRadius: 2,
+                        pointHoverRadius: 4,
+                    }],
+                },
+                options: {
+                    responsive: true, // Enable responsive behavior
+                    maintainAspectRatio: false, // Adapt to detail panel size
+                        plugins: {
+                            legend: {
+                                display: false,
+                            },
+                            tooltip: {
+                                mode: "index",
+                                intersect: false,
+                            },
+                        },
+                        scales: {
+                            x: {
+                                ticks: {
+                                    color: "rgb(148, 163, 184)",
+                                    font: { size: 9 },
+                                    maxRotation: 45,
+                                    minRotation: 45,
+                                },
+                                grid: {
+                                    display: false,
+                                },
+                            },
+                            y: {
+                                beginAtZero: true,
+                                ticks: {
+                                    color: "rgb(148, 163, 184)",
+                                    font: { size: 10 },
+                                },
+                                grid: {
+                                    color: "rgba(51, 65, 85, 0.3)",
+                                },
+                                title: {
+                                    display: true,
+                                    text: "Time (ms)",
+                                    color: "rgb(148, 163, 184)",
+                                    font: { size: 10 },
+                                },
+                            },
+                        },
+                    },
+                });
+            } else {
+                console.warn("Chart container not found for domain:", domainId);
+            }
+        }
+        
+        // Wait-for-element helper: ensures both canvas containers exist before rendering
+        async function waitForContainers(id) {
+            // Debugging Log: Add detailed logging to help identify ID mismatch or missing elements
+            console.log("Searching for:", "latencyChart-" + id);
+            console.log("Searching for:", "breakdownChart-" + id);
+            console.log("All current canvas IDs on page:", Array.from(document.querySelectorAll('canvas')).map(c => c.id));
+            
+            for (let i = 0; i < 10; i++) { // Maximum 10 attempts
+                const c1 = document.getElementById("latencyChart-" + id);
+                const c2 = document.getElementById("breakdownChart-" + id);
+                if (c1 && c2) {
+                    console.log("Both canvas containers found for domain:", id, "on attempt", i + 1);
+                    return true;
+                }
+                if (i === 0) {
+                    console.log("Attempt 1 - latencyChart found:", !!c1, "breakdownChart found:", !!c2);
+                }
+                await new Promise(r => setTimeout(r, 100)); // Check every 100ms
+            }
+            console.warn("Canvas containers not found after 10 attempts for domain:", id);
+            console.warn("Final check - latencyChart found:", !!document.getElementById("latencyChart-" + id));
+            console.warn("Final check - breakdownChart found:", !!document.getElementById("breakdownChart-" + id));
+            return false;
+        }
+        
+        // Unified async function to render all domain charts (encapsulated in function scope to avoid conflicts)
+        async function renderDomainCharts(id, data) {
+            // Function scope isolation - all variables are scoped within this function
+            const domainId = id;
+            const heartbeats = data.heartbeats_24h || [];
+            const recent50 = data.recent_50 || [];
+            
+            // Nuclear Fix: log target IDs and yield one animation frame so the browser can paint newly inserted DOM.
+            console.log("Attempting to render on:", "latencyChart-" + domainId, "and", "breakdownChart-" + domainId);
+            await new Promise((resolve) => {
+                if (typeof requestAnimationFrame === "function") {
+                    requestAnimationFrame(() => resolve());
+                } else {
+                    // Fallback in non-browser or older environments
+                    setTimeout(resolve, 0);
+                }
+            });
+            
+            // Step 1: Wait for both canvas containers to exist in DOM
+            const containersReady = await waitForContainers(domainId);
+            if (!containersReady) {
+                console.error("Cannot render charts: containers not ready for domain:", domainId);
+                return;
+            }
+            
+            // Error handling: if data is empty, show friendly message
+            if (!heartbeats || heartbeats.length === 0) {
+                const canvasId = "latencyChart-" + domainId;
+                const canvas = document.getElementById(canvasId);
+                if (canvas) {
+                    const parent = canvas.parentElement;
+                    if (parent) {
+                        // Data fallback: clearly indicate that the chart containers are ready but waiting for data.
+                        parent.innerHTML = '<div class="flex items-center justify-center h-full text-xs text-slate-400 italic">Waiting for initial data...</div>';
+                    }
+                }
+                return;
+            }
+            
+            // Re-trigger Bar Rendering: Ensure Uptime Bar rendering logic is preserved in renderDomainCharts
+            const uptimeBarContainer = document.getElementById("uptimeBar-" + domainId);
+            if (uptimeBarContainer && recent50 && recent50.length > 0) {
+                uptimeBarContainer.innerHTML = "";
+                
+                // Loop through last 50 data points: success (status 200) = bg-emerald-500, failure = bg-rose-500
+                // Reverse to show oldest first (left to right)
+                const reversed = [...recent50].reverse();
+                for (const hb of reversed) {
+                    const isSuccess = (hb.status_code || hb.StatusCode || 0) >= 200 && (hb.status_code || hb.StatusCode || 0) < 400;
+                    // Use emerald-500 for success, rose-500 for failure (as specified)
+                    const color = isSuccess ? "bg-emerald-500" : "bg-rose-500";
+                    const timestamp = hb.created_at || hb.CreatedAt ? new Date(hb.created_at || hb.CreatedAt).toLocaleString() : "N/A";
+                    const statusCode = hb.status_code || hb.StatusCode || 0;
+                    const latency = hb.latency || hb.Latency || 0;
+                    const square = document.createElement("div");
+                    square.className = "uptime-square " + color;
+                    square.title = timestamp + " - Status: " + statusCode + " (" + latency + "ms)";
+                    uptimeBarContainer.appendChild(square);
+                }
+            }
+            
+            // Render line chart for total latency
+            await renderLatencyLineChart(domainId, heartbeats);
+            
+            // Render stacked bar chart for response time breakdown
+            renderResponseTimeBreakdown(domainId, heartbeats);
+        }
+        
+        // Unified function to initialize all domain charts (line chart + stacked bar chart)
+        function initDomainCharts(domainId, heartbeats, recent50) {
+            // Render line chart for total latency
+            renderUptimeChartWithRetry(domainId, heartbeats, recent50);
+            
+            // Render stacked bar chart for response time breakdown
+            renderResponseTimeBreakdown(domainId, heartbeats);
+        }
+        
+        // Alias for backward compatibility
+        function renderAllCharts(domainId, heartbeats, recent50) {
+            initDomainCharts(domainId, heartbeats, recent50);
+        }
+        
+        // Render Response Time Breakdown as Stacked Bar Chart
+        function renderResponseTimeBreakdown(domainId, heartbeats) {
+            if (!heartbeats || heartbeats.length === 0) {
+                console.warn("No heartbeat data for breakdown chart");
+                return;
+            }
+            
+            const canvasId = "breakdownChart-" + domainId;
+            const canvas = document.getElementById(canvasId);
+            
+            // Defensive check: ensure canvas exists before rendering
+            if (!canvas) {
+                console.warn("Breakdown chart container not found:", canvasId);
+                return;
+            }
+            
+            // Get canvas context - additional defensive check
+            const ctx = canvas.getContext("2d");
+            if (!ctx) {
+                console.warn("Failed to get 2D context for breakdown chart:", canvasId);
+                return;
+            }
+            
+            // Prepare data: limit to last 20 heartbeats for readability
+            const recentHeartbeats = heartbeats.slice(-20);
+            const labels = recentHeartbeats.map(hb => {
+                // Support both snake_case (created_at) and camelCase (CreatedAt) from backend
+                const createdAt = hb.CreatedAt || hb.created_at;
+                const d = new Date(createdAt);
+                // Time Formatting: Use toLocaleTimeString() for X-axis labels
+                return d.toLocaleTimeString();
+            });
+            
+            // Extract timing breakdowns with robust parsing (handle null, string, or number)
+            // Use correct field names from backend: dns_lookup, tcp_connection, tls_handshake, ttfb
+            // Data sanity check: if value is undefined or 0, use 0.1 to prevent stacked bar chart from not displaying
+            const dnsData = recentHeartbeats.map(hb => {
+                const val = hb.dns_lookup || hb.dnsLookup; // Support both snake_case and camelCase
+                if (val === null || val === undefined) return 0.1; // Use 0.1 instead of 0 for visibility
+                const num = typeof val === "string" ? parseFloat(val) : Number(val);
+                return isNaN(num) || num === 0 ? 0.1 : num; // Ensure minimum 0.1 for stacked chart visibility
+            });
+            
+            const tcpData = recentHeartbeats.map(hb => {
+                const val = hb.tcp_connection || hb.tcpConnection; // Support both snake_case and camelCase
+                if (val === null || val === undefined) return 0.1; // Use 0.1 instead of 0 for visibility
+                const num = typeof val === "string" ? parseFloat(val) : Number(val);
+                return isNaN(num) || num === 0 ? 0.1 : num; // Ensure minimum 0.1 for stacked chart visibility
+            });
+            
+            const tlsData = recentHeartbeats.map(hb => {
+                const val = hb.tls_handshake || hb.tlsHandshake; // Support both snake_case and camelCase
+                if (val === null || val === undefined) return 0.1; // Use 0.1 instead of 0 for visibility
+                const num = typeof val === "string" ? parseFloat(val) : Number(val);
+                return isNaN(num) || num === 0 ? 0.1 : num; // Ensure minimum 0.1 for stacked chart visibility
+            });
+            
+            const ttfbData = recentHeartbeats.map(hb => {
+                const val = hb.ttfb || hb.server_response; // Support both ttfb and server_response
+                if (val === null || val === undefined) return 0.1; // Use 0.1 instead of 0 for visibility
+                const num = typeof val === "string" ? parseFloat(val) : Number(val);
+                return isNaN(num) || num === 0 ? 0.1 : num; // Ensure minimum 0.1 for stacked chart visibility
+            });
+            
+            // Chart instance management: destroy existing instance before creating new one
+            // Fix Chart.js Instance Management: check window.chartInstances (or chartInstances) before creating
+            const breakdownChartId = "breakdownChart-" + domainId;
+            if (window.chartInstances && window.chartInstances[breakdownChartId]) {
+                window.chartInstances[breakdownChartId].destroy(); // Destroy old instance
+                delete window.chartInstances[breakdownChartId];
+            } else if (chartInstances[breakdownChartId]) {
+                chartInstances[breakdownChartId].destroy(); // Destroy old instance
+                delete chartInstances[breakdownChartId];
+            }
+            
+            // Create new Chart instance and store in registry
+            const registry = window.chartInstances || chartInstances;
+            registry[breakdownChartId] = new Chart(ctx, {
+                type: "bar",
+                data: {
+                    labels: labels,
+                    datasets: [
+                        {
+                            label: "DNS Lookup",
+                            data: dnsData,
+                            backgroundColor: "rgb(59, 130, 246)", // sky-500
+                        },
+                        {
+                            label: "TCP Connection",
+                            data: tcpData,
+                            backgroundColor: "rgb(168, 85, 247)", // purple-500
+                        },
+                        {
+                            label: "TLS Handshake",
+                            data: tlsData,
+                            backgroundColor: "rgb(245, 158, 11)", // amber-500
+                        },
+                        {
+                            label: "Server Response (TTFB)",
+                            data: ttfbData,
+                            backgroundColor: "rgb(16, 185, 129)", // emerald-500
+                        },
+                    ],
+                },
+                options: {
+                    responsive: true, // Enable responsive behavior
+                    maintainAspectRatio: false, // Adapt to detail panel size
+                    scales: {
+                        x: {
+                            stacked: true,
+                            ticks: {
+                                color: "rgb(148, 163, 184)",
+                                font: { size: 9 },
+                                maxRotation: 45,
+                                minRotation: 45,
+                            },
+                            grid: {
+                                display: false,
+                            },
+                        },
+                        y: {
+                            stacked: true,
+                            beginAtZero: true,
+                            ticks: {
+                                color: "rgb(148, 163, 184)",
+                                font: { size: 10 },
+                            },
+                            grid: {
+                                color: "rgba(51, 65, 85, 0.3)",
+                            },
+                            title: {
+                                display: true,
+                                text: "Time (ms)",
+                                color: "rgb(148, 163, 184)",
+                                font: { size: 10 },
+                            },
+                        },
+                    },
+                    plugins: {
+                        legend: {
+                            display: false, // Legend is shown in HTML below chart
+                        },
+                        tooltip: {
+                            mode: "index",
+                            intersect: false,
+                        },
+                    },
+                },
+            });
+        }
+
+        // Open edit modal for Tags or CustomStatus
+        function openEditModal(domainId, field, currentValue) {
+            const modal = document.getElementById("edit-domain-modal");
+            if (!modal) {
+                // Create modal if it doesn't exist
+                createEditDomainModal();
+            }
+            const modalInstance = document.getElementById("edit-domain-modal");
+            const fieldInput = document.getElementById("edit-domain-field");
+            const valueInput = document.getElementById("edit-domain-value");
+            const tagsInput = document.getElementById("edit-domain-tags");
+            const statusInput = document.getElementById("edit-domain-status");
+            const titleEl = document.getElementById("edit-domain-title");
+
+            // Get domain ID from data-id attribute if domainId is not provided or is a domain name
+            // Ensure we get the numeric database ID, not domain name
+            if (!domainId || isNaN(domainId)) {
+                const row = document.querySelector('tr[data-domain-id="' + domainId + '"]');
+                if (row && row.dataset.id) {
+                    domainId = row.dataset.id;
+                } else if (row && row.dataset.domainId && !isNaN(row.dataset.domainId)) {
+                    domainId = row.dataset.domainId;
+                }
+            }
+            
+            // Store the current domain ID in a variable accessible to the form submit handler
+            // This ensures we always use the numeric ID from domain.ID
+            const currentDomainId = domainId;
+            console.log("Opening edit modal for domain ID:", currentDomainId);
+            
+            // Ensure the hidden input field is set with the numeric ID (single declaration)
+            const domainIdInput = document.getElementById("edit-domain-id");
+            if (domainIdInput) {
+                domainIdInput.value = String(currentDomainId);
+                console.log("Set edit-domain-id input to:", currentDomainId);
+            }
+
+            if (field === "both") {
+                // Edit both fields
+                titleEl.textContent = "Edit Domain Tags & Status";
+                document.getElementById("edit-domain-tags-group").classList.remove("hidden");
+                document.getElementById("edit-domain-status-group").classList.remove("hidden");
+                document.getElementById("edit-domain-single-group").classList.add("hidden");
+                if (tagsInput) tagsInput.value = currentValue.tags || "";
+                if (statusInput) statusInput.value = currentValue.custom_status || "";
+            } else {
+                // Edit single field
+                titleEl.textContent = field === "tags" ? "Edit Tags" : "Edit Custom Status";
+                document.getElementById("edit-domain-single-group").classList.remove("hidden");
+                document.getElementById("edit-domain-tags-group").classList.add("hidden");
+                document.getElementById("edit-domain-status-group").classList.add("hidden");
+                if (fieldInput) fieldInput.value = field;
+                if (valueInput) valueInput.value = currentValue || "";
+            }
+
+            if (fieldInput) fieldInput.value = field;
+            // Store in both dataset and hidden input for reliability
+            // Use currentDomainId which is guaranteed to be numeric
+            modalInstance.dataset.domainId = currentDomainId;
+            modalInstance.dataset.id = currentDomainId;
+            modalInstance.dataset.currentDomainId = currentDomainId; // Additional storage for form submit
+            modalInstance.classList.remove("hidden");
+            modalInstance.classList.add("flex");
+        }
+
+        // Create edit domain modal
+        function createEditDomainModal() {
+            const modal = document.createElement("div");
+            modal.id = "edit-domain-modal";
+            modal.className = "fixed inset-0 hidden z-40 items-center justify-center bg-slate-950/70 backdrop-blur-sm";
+            modal.setAttribute("aria-hidden", "true");
+            modal.innerHTML = 
+                '<div class="w-full max-w-sm rounded-2xl border border-slate-800 bg-slate-900 shadow-xl shadow-black/50 p-6 space-y-4">' +
+                    '<div class="flex items-center justify-between mb-3">' +
+                        '<div>' +
+                            '<h2 id="edit-domain-title" class="text-sm font-semibold tracking-tight">Edit Domain</h2>' +
+                            '<p class="text-[11px] text-slate-400">' +
+                                'Update tags or custom status for this domain' +
+                            '</p>' +
+                        '</div>' +
+                        '<button' +
+                            ' id="edit-domain-close"' +
+                            ' class="text-slate-400 hover:text-slate-100 text-xs"' +
+                            ' aria-label="Close modal"' +
+                        '>' +
+                            '&times;' +
+                        '</button>' +
+                    '</div>' +
+                    '<form id="edit-domain-form" class="space-y-3">' +
+                        '<input type="hidden" id="edit-domain-field" value="" />' +
+                        '<input type="hidden" id="edit-domain-id" value="" />' +
+                        '<div id="edit-domain-single-group" class="hidden">' +
+                            '<label class="block text-xs font-medium text-slate-300" for="edit-domain-value">' +
+                                'Value' +
+                            '</label>' +
+                            '<input' +
+                                ' id="edit-domain-value"' +
+                                ' type="text"' +
+                                ' class="mt-1 w-full rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/70 focus:border-emerald-500/70"' +
+                                ' placeholder="Enter value"' +
+                            ' />' +
+                        '</div>' +
+                        '<div id="edit-domain-tags-group" class="hidden">' +
+                            '<label class="block text-xs font-medium text-slate-300" for="edit-domain-tags">' +
+                                'Tags (comma-separated)' +
+                            '</label>' +
+                            '<input' +
+                                ' id="edit-domain-tags"' +
+                                ' type="text"' +
+                                ' class="mt-1 w-full rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/70 focus:border-emerald-500/70"' +
+                                ' placeholder="production, api, critical"' +
+                            ' />' +
+                            '<p class="text-[11px] text-slate-500 mt-1">' +
+                                'Separate multiple tags with commas' +
+                            '</p>' +
+                        '</div>' +
+                        '<div id="edit-domain-status-group" class="hidden">' +
+                            '<label class="block text-xs font-medium text-slate-300" for="edit-domain-status">' +
+                                'Custom Status' +
+                            '</label>' +
+                            '<input' +
+                                ' id="edit-domain-status"' +
+                                ' type="text"' +
+                                ' class="mt-1 w-full rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500/70 focus:border-emerald-500/70"' +
+                                ' placeholder="Production, Testing, Pending Migration"' +
+                            ' />' +
+                        '</div>' +
+                        '<p id="edit-domain-error" class="text-[11px] text-rose-400 min-h-[1.25rem]"></p>' +
+                        '<div class="flex items-center justify-end gap-2">' +
+                            '<button' +
+                                ' type="button"' +
+                                ' id="edit-domain-cancel"' +
+                                ' class="rounded-lg border border-slate-700 px-3 py-1.5 text-[11px] text-slate-300 hover:bg-slate-800/80"' +
+                            '>' +
+                                'Cancel' +
+                            '</button>' +
+                            '<button' +
+                                ' type="submit"' +
+                                ' id="edit-domain-submit"' +
+                                ' class="inline-flex items-center gap-2 rounded-lg bg-emerald-500 px-3 py-1.5 text-[11px] font-medium text-slate-950 shadow-lg shadow-emerald-500/25 hover:bg-emerald-400 focus:outline-none focus:ring-2 focus:ring-emerald-500/70 disabled:opacity-60 disabled:cursor-not-allowed"' +
+                            '>' +
+                                '<span>Save</span>' +
+                            '</button>' +
+                        '</div>' +
+                    '</form>' +
+                '</div>';
+            document.body.appendChild(modal);
+
+            // Wire up event listeners
+            const closeBtn = document.getElementById("edit-domain-close");
+            const cancelBtn = document.getElementById("edit-domain-cancel");
+            const form = document.getElementById("edit-domain-form");
+
+            if (closeBtn) {
+                closeBtn.addEventListener("click", function() {
+                    modal.classList.add("hidden");
+                    modal.classList.remove("flex");
+                    const errorEl = document.getElementById("edit-domain-error");
+                    if (errorEl) errorEl.textContent = "";
+                });
+            }
+
+            if (cancelBtn) {
+                cancelBtn.addEventListener("click", function(e) {
+                    e.preventDefault();
+                    modal.classList.add("hidden");
+                    modal.classList.remove("flex");
+                    const errorEl = document.getElementById("edit-domain-error");
+                    if (errorEl) errorEl.textContent = "";
+                });
+            }
+
+            if (form) {
+                form.addEventListener("submit", async function(e) {
+                    e.preventDefault();
+                    // Force use the numeric domain ID stored when modal was opened
+                    // Priority: window.currentEditingId (locked when Edit button clicked) > modal.dataset > hidden input
+                    let currentDomainId = window.currentEditingId || modal.dataset.currentDomainId || modal.dataset.id || modal.dataset.domainId;
+                    const domainIdInput = document.getElementById("edit-domain-id");
+                    let domainId = currentDomainId || (domainIdInput ? domainIdInput.value : "");
+                    
+                    const field = document.getElementById("edit-domain-field").value;
+                    const errorEl = document.getElementById("edit-domain-error");
+                    const submitBtn = document.getElementById("edit-domain-submit");
+
+                    // Final validation: domainId must be numeric (database ID)
+                    if (!domainId || isNaN(domainId)) {
+                        errorEl.textContent = "Invalid domain ID. The domain ID must be a number. Please refresh and try again.";
+                        submitBtn.disabled = false;
+                        return;
+                    }
+
+                    // Ensure domainId is a string for URL construction
+                    domainId = String(domainId);
+                    console.log("Saving domain with ID:", domainId, "(locked from Edit button click)");
+                    console.log("Saving ID:", currentDomainId);
+
+                    errorEl.textContent = "";
+                    submitBtn.disabled = true;
+
+                    try {
+                        const updateData = {};
+                        if (field === "both") {
+                            const tags = document.getElementById("edit-domain-tags").value.trim();
+                            const status = document.getElementById("edit-domain-status").value.trim();
+                            updateData.tags = tags;
+                            updateData.custom_status = status;
+                        } else if (field === "tags") {
+                            const value = document.getElementById("edit-domain-value").value.trim();
+                            updateData.tags = value;
+                        } else if (field === "custom_status") {
+                            const value = document.getElementById("edit-domain-value").value.trim();
+                            updateData.custom_status = value;
+                        }
+
+                        // Construct URL with numeric domain ID - use PUT as requested
+                        const url = "/v1/admin/domains/" + domainId;
+                        console.log("Request URL:", url, "Method: PUT");
+                        const resp = await apiFetch(url, {
+                            method: "PUT",
+                            headers: {
+                                "Content-Type": "application/json",
+                                "Accept": "application/json",
+                            },
+                            body: JSON.stringify(updateData),
+                        });
+
+                        if (!resp.ok) {
+                            const data = await resp.json();
+                            throw new Error(data.error || "Failed to update domain");
+                        }
+
+                        modal.classList.add("hidden");
+                        modal.classList.remove("flex");
+                        loadDomains(); // Refresh the table
+                    } catch (err) {
+                        console.error(err);
+                        errorEl.textContent = err.message || "Unexpected error while updating domain.";
+                    } finally {
+                        submitBtn.disabled = false;
+                    }
+                });
+            }
+        }
+
+        // Delete Monitor modal helpers
+        function openDeleteMonitorModal(domainId, domainName) {
+            const modal = document.getElementById("delete-monitor-modal");
+            const messageEl = document.getElementById("delete-monitor-message");
+            currentDeleteDomainId = String(domainId);
+            currentDeleteDomainName = domainName || "";
+            if (messageEl) {
+                const safeName = currentDeleteDomainName || "this monitor";
+                messageEl.textContent = "Are you sure you want to delete " + safeName + "? This action will permanently remove all heartbeat history and cannot be undone.";
+            }
+            if (modal) {
+                modal.classList.remove("hidden");
+                modal.classList.add("flex");
+            }
+        }
+
+        function closeDeleteMonitorModal() {
+            const modal = document.getElementById("delete-monitor-modal");
+            if (modal) {
+                modal.classList.add("hidden");
+                modal.classList.remove("flex");
+            }
+            currentDeleteDomainId = null;
+            currentDeleteDomainName = "";
         }
 
         // Load and display notification configurations
@@ -2529,6 +3842,11 @@ func handleDashboard(c *gin.Context) {
                 const total = typeof summary.total_scanned === "number" ? summary.total_scanned : results.length;
                 const atRisk = typeof summary.at_risk === "number" ? summary.at_risk : 0;
                 summaryText.textContent = "Scanned " + total + " domains • At risk: " + atRisk;
+                
+                // Refresh domains list to show newly scanned domains
+                if (typeof loadDomains === "function") {
+                    loadDomains();
+                }
             } catch (err) {
                 console.error(err);
                 errorEl.textContent = err.message || "Unexpected error while running scan.";
@@ -3180,6 +4498,170 @@ func handleDashboard(c *gin.Context) {
                     },
                 },
             });
+        }
+
+        // Auto-Refresh Logic (Polling): Global timer for automatic refresh every 60 seconds
+        let autoRefreshInterval = null;
+        let expandedDomainDetails = new Set(); // Track which domain detail panels are expanded
+
+        function startAutoRefresh() {
+            // Clear existing interval if any
+            if (autoRefreshInterval) {
+                clearInterval(autoRefreshInterval);
+            }
+            
+            // Auto-refresh every 60 seconds
+            autoRefreshInterval = setInterval(async () => {
+                console.log("Auto-refreshing domains...");
+
+                // Snapshot currently expanded domain detail rows
+                const previouslyExpanded = new Set(expandedDomainDetails || []);
+
+                // Refresh domain list (full reload)
+                if (typeof loadDomains === "function") {
+                    await loadDomains();
+                }
+
+                // Re-open previously expanded detail rows so the user view is preserved
+                if (typeof toggleDomainDetail === "function") {
+                    previouslyExpanded.forEach(domainId => {
+                        const row = document.querySelector('tr[data-domain-id=\"' + domainId + '\"]');
+                        if (row) {
+                            // toggleDomainDetail will create detail row if missing
+                            toggleDomainDetail(domainId);
+                            // ensure it's tracked as expanded
+                            expandedDomainDetails.add(String(domainId));
+                        } else if (expandedDomainDetails) {
+                            // Domain no longer exists, stop tracking
+                            expandedDomainDetails.delete(String(domainId));
+                        }
+                    });
+                }
+                
+                // Smart refresh: If a domain's detail panel is expanded, sync trigger fetchHeartbeats(id)
+                // This allows charts to update \"seamlessly\" without manual clicks
+                expandedDomainDetails.forEach(domainId => {
+                    const detailRow = document.getElementById("detail-" + domainId);
+                    if (detailRow && detailRow.style.display !== "none") {
+                        console.log("Auto-refreshing heartbeat data for domain:", domainId);
+                        if (typeof fetchHeartbeats === "function") {
+                            fetchHeartbeats(domainId);
+                        }
+                    } else if (expandedDomainDetails) {
+                        // Remove from tracking if panel is no longer visible
+                        expandedDomainDetails.delete(String(domainId));
+                    }
+                });
+                
+                // Update last updated time
+                updateLastUpdatedTime();
+            }, 60000); // 60 seconds
+        }
+
+        function stopAutoRefresh() {
+            if (autoRefreshInterval) {
+                clearInterval(autoRefreshInterval);
+                autoRefreshInterval = null;
+            }
+        }
+
+        // Update "Last Updated" indicator
+        function updateLastUpdatedTime() {
+            const timeEl = document.getElementById("last-updated-time");
+            if (timeEl) {
+                const now = new Date();
+                const timeStr = now.toLocaleTimeString();
+                timeEl.textContent = "Last updated at: " + timeStr;
+            }
+        }
+
+        // Manual refresh with rotation animation
+        async function manualRefresh() {
+            const refreshBtn = document.getElementById("manual-refresh-btn");
+            const refreshIcon = document.getElementById("refresh-icon");
+            
+            if (refreshBtn && refreshIcon) {
+                // Add rotation animation
+                refreshIcon.classList.add("animate-spin");
+                refreshBtn.disabled = true;
+                
+                try {
+                    // Refresh domain list
+                    if (typeof loadDomains === "function") {
+                        await loadDomains();
+                    }
+                    
+                    // Refresh expanded detail panels
+                    expandedDomainDetails.forEach(domainId => {
+                        const detailRow = document.getElementById("detail-" + domainId);
+                        if (detailRow && detailRow.style.display !== "none") {
+                            if (typeof fetchHeartbeats === "function") {
+                                fetchHeartbeats(domainId);
+                            }
+                        }
+                    });
+                    
+                    // Update last updated time
+                    updateLastUpdatedTime();
+                } finally {
+                    // Remove rotation animation after a short delay
+                    setTimeout(() => {
+                        refreshIcon.classList.remove("animate-spin");
+                        refreshBtn.disabled = false;
+                    }, 500);
+                }
+            }
+        }
+
+        // Collapsible Sidebar Optimization
+        function initSidebarToggle() {
+            const sidebar = document.getElementById("sidebar");
+            const sidebarToggle = document.getElementById("sidebar-toggle");
+            const sidebarBrand = document.getElementById("sidebar-brand");
+            const sidebarText = document.getElementById("sidebar-text");
+            const sidebarNav = document.getElementById("sidebar-nav");
+            const navTexts = document.querySelectorAll(".nav-text");
+            
+            if (!sidebar || !sidebarToggle) return;
+            
+            let isCollapsed = false;
+            
+            sidebarToggle.addEventListener("click", () => {
+                isCollapsed = !isCollapsed;
+                
+                if (isCollapsed) {
+                    // Collapse: show only icons with tooltips
+                    sidebar.classList.remove("w-60");
+                    sidebar.classList.add("w-16");
+                    if (sidebarText) sidebarText.style.display = "none";
+                    navTexts.forEach(text => {
+                        text.style.display = "none";
+                    });
+                    // Add tooltips to nav buttons
+                    document.querySelectorAll("#sidebar-nav button").forEach(btn => {
+                        if (!btn.getAttribute("data-tooltip")) {
+                            btn.setAttribute("data-tooltip", btn.getAttribute("title") || "");
+                        }
+                    });
+                } else {
+                    // Expand: show icons + text
+                    sidebar.classList.remove("w-16");
+                    sidebar.classList.add("w-60");
+                    if (sidebarText) sidebarText.style.display = "";
+                    navTexts.forEach(text => {
+                        text.style.display = "";
+                    });
+                }
+            });
+        }
+
+        // Track expanded domain details
+        function trackExpandedDomain(domainId) {
+            expandedDomainDetails.add(domainId);
+        }
+
+        function untrackExpandedDomain(domainId) {
+            expandedDomainDetails.delete(domainId);
         }
 
         // Wire up event listeners once the DOM is ready
@@ -4009,22 +5491,29 @@ func handleDashboard(c *gin.Context) {
                             });
                             const data = await resp.json().catch(() => ({}));
                             if (!resp.ok) {
-                                const msg = data && data.error ? data.error : "Login failed.";
-                                throw new Error(msg);
-                            }
-                            saveAuth(data.token, { username: data.username, role: data.role });
-                            updateUserUI();
-                            ensureAuthenticated();
-                            // Switch to dashboard view after login
-                            setActiveView("dashboard");
-                            // Also call showSection for compatibility if it exists
-                            if (typeof showSection === 'function') {
-                                showSection('dashboard');
-                            }
-                            // Load initial data after login
-                            if (typeof loadProjects === 'function') loadProjects();
-                            if (typeof loadInfraOptions === 'function') loadInfraOptions();
-                            if (typeof loadInfraResources === 'function') loadInfraResources();
+                            const msg = data && data.error ? data.error : "Login failed.";
+                            throw new Error(msg);
+                        }
+                        saveAuth(data.token, { username: data.username, role: data.role });
+                        updateUserUI();
+                        ensureAuthenticated();
+                        // Start auto-refresh and update last updated time after successful login
+                        if (typeof startAutoRefresh === "function") {
+                            startAutoRefresh();
+                        }
+                        if (typeof updateLastUpdatedTime === "function") {
+                            updateLastUpdatedTime();
+                        }
+                        // Switch to dashboard view after login
+                        setActiveView("dashboard");
+                        // Also call showSection for compatibility if it exists
+                        if (typeof showSection === 'function') {
+                            showSection('dashboard');
+                        }
+                        // Load initial data
+                        if (typeof loadProjects === 'function') loadProjects();
+                        if (typeof loadInfraOptions === 'function') loadInfraOptions();
+                        if (typeof loadInfraResources === 'function') loadInfraResources();
                         } catch (err) {
                             console.error(err);
                             errorEl.textContent = err.message || "Unexpected error while logging in.";
@@ -4058,7 +5547,83 @@ func handleDashboard(c *gin.Context) {
                 });
             }
 
-            // Initial auth state
+            // Delete monitor modal events
+            const deleteModal = document.getElementById("delete-monitor-modal");
+            const deleteCloseBtn = document.getElementById("delete-monitor-close");
+            const deleteCancelBtn = document.getElementById("delete-monitor-cancel");
+            const deleteConfirmBtn = document.getElementById("delete-monitor-confirm");
+
+            if (deleteCloseBtn) {
+                deleteCloseBtn.addEventListener("click", function () {
+                    closeDeleteMonitorModal();
+                });
+            }
+
+            if (deleteCancelBtn) {
+                deleteCancelBtn.addEventListener("click", function (e) {
+                    e.preventDefault();
+                    closeDeleteMonitorModal();
+                });
+            }
+
+            if (deleteModal) {
+                deleteModal.addEventListener("click", function (e) {
+                    if (e.target === deleteModal) {
+                        closeDeleteMonitorModal();
+                    }
+                });
+            }
+
+            if (deleteConfirmBtn) {
+                deleteConfirmBtn.addEventListener("click", async function () {
+                    if (!currentDeleteDomainId) {
+                        return;
+                    }
+                    const btn = deleteConfirmBtn;
+                    const originalText = btn.textContent;
+                    btn.disabled = true;
+                    btn.textContent = "Deleting...";
+
+                    try {
+                        const url = "/v1/admin/domains/" + encodeURIComponent(currentDeleteDomainId);
+                        console.log("Deleting monitor", currentDeleteDomainId, "via", url);
+                        const resp = await apiFetch(url, {
+                            method: "DELETE",
+                            headers: { "Accept": "application/json" },
+                        });
+                        const data = await resp.json().catch(() => ({}));
+                        if (!resp.ok) {
+                            const msg = data && data.error ? data.error : "Failed to delete monitor";
+                            throw new Error(msg);
+                        }
+
+                        closeDeleteMonitorModal();
+                        if (typeof loadDomains === "function") {
+                            await loadDomains();
+                        }
+                        // Ensure removed ID is no longer tracked for auto-refresh
+                        if (expandedDomainDetails && currentDeleteDomainId) {
+                            expandedDomainDetails.delete(String(currentDeleteDomainId));
+                        }
+                        if (typeof showToast === "function") {
+                            const name = currentDeleteDomainName || "monitor";
+                            showToast(name + " deleted successfully.", "success");
+                        }
+                        // Update last updated time after deletion
+                        if (typeof updateLastUpdatedTime === "function") {
+                            updateLastUpdatedTime();
+                        }
+                    } catch (err) {
+                        console.error(err);
+                        if (typeof showToast === "function") {
+                            showToast(err.message || "Failed to delete monitor", "error");
+                        }
+                    } finally {
+                        btn.disabled = false;
+                        btn.textContent = originalText;
+                    }
+                });
+            }
             updateUserUI();
             ensureAuthenticated();
 
@@ -4067,6 +5632,21 @@ func handleDashboard(c *gin.Context) {
                 loadProjects();
                 loadInfraOptions();
                 loadInfraResources();
+                
+                // Start auto-refresh timer
+                startAutoRefresh();
+                
+                // Update last updated time on initial load
+                updateLastUpdatedTime();
+            }
+
+            // Initialize sidebar toggle
+            initSidebarToggle();
+
+            // Manual refresh button
+            const manualRefreshBtn = document.getElementById("manual-refresh-btn");
+            if (manualRefreshBtn) {
+                manualRefreshBtn.addEventListener("click", manualRefresh);
             }
         });
 
@@ -4776,6 +6356,202 @@ func handleManualRenew(c *gin.Context) {
 	})
 }
 
+// handleUpdateDomain updates Tags and CustomStatus for a domain
+func handleUpdateDomain(c *gin.Context) {
+	if database.DB == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not initialized"})
+		return
+	}
+
+	idParam := c.Param("id")
+	if idParam == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "domain ID is required"})
+		return
+	}
+
+	// Convert string ID to uint - try parsing as uint first
+	var domainID uint
+	if _, err := fmt.Sscanf(idParam, "%d", &domainID); err != nil {
+		// If parsing fails, try to find by domain name (for backward compatibility)
+		var domainByName database.MonitoredDomain
+		if err := database.DB.Where("domain_name = ?", idParam).First(&domainByName).Error; err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "domain not found"})
+			return
+		}
+		domainID = domainByName.ID
+	}
+
+	var domain database.MonitoredDomain
+	if err := database.DB.First(&domain, domainID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "domain not found"})
+		return
+	}
+
+	var body struct {
+		Tags         *string `json:"tags"`
+		CustomStatus *string `json:"custom_status"`
+	}
+
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	updateData := map[string]interface{}{}
+	if body.Tags != nil {
+		updateData["tags"] = *body.Tags
+	}
+	if body.CustomStatus != nil {
+		updateData["custom_status"] = *body.CustomStatus
+	}
+
+	if len(updateData) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "at least one field (tags or custom_status) must be provided"})
+		return
+	}
+
+	if err := database.DB.Model(&domain).Updates(updateData).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update domain"})
+		return
+	}
+
+	// Reload domain to return updated data
+	database.DB.First(&domain, domainID)
+
+	c.JSON(http.StatusOK, gin.H{
+		"id":            domain.ID,
+		"domain_name":   domain.DomainName,
+		"tags":          domain.Tags,
+		"custom_status": domain.CustomStatus,
+	})
+}
+
+// handleDeleteDomain deletes a monitored domain and all associated heartbeat records.
+func handleDeleteDomain(c *gin.Context) {
+	if database.DB == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not initialized"})
+		return
+	}
+
+	idParam := c.Param("id")
+	if idParam == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "domain ID is required"})
+		return
+	}
+
+	// Resolve domain by ID or domain name (backward compatibility)
+	var domain database.MonitoredDomain
+	var domainID uint
+	if _, err := fmt.Sscanf(idParam, "%d", &domainID); err == nil {
+		if err := database.DB.First(&domain, domainID).Error; err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "domain not found"})
+			return
+		}
+	} else {
+		if err := database.DB.Where("domain_name = ?", idParam).First(&domain).Error; err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "domain not found"})
+			return
+		}
+		domainID = domain.ID
+	}
+
+	tx := database.DB.Begin()
+	if tx.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start transaction"})
+		return
+	}
+
+	// Delete associated heartbeat records first to avoid orphaned data
+	if err := tx.Where("domain_id = ?", domainID).Delete(&database.Heartbeat{}).Error; err != nil {
+		tx.Rollback()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete associated heartbeats"})
+		return
+	}
+
+	// Delete the domain itself (physical delete)
+	if err := tx.Delete(&domain).Error; err != nil {
+		tx.Rollback()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete domain"})
+		return
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to commit transaction"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "domain and associated heartbeats deleted successfully",
+		"id":      domainID,
+	})
+}
+
+// handleGetDomainHeartbeats returns heartbeat data for a domain (last 24 hours)
+func handleGetDomainHeartbeats(c *gin.Context) {
+	if database.DB == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "database not initialized"})
+		return
+	}
+
+	idParam := c.Param("id")
+	if idParam == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "domain ID is required"})
+		return
+	}
+
+	// Convert string ID to uint
+	var domainID uint
+	if _, err := fmt.Sscanf(idParam, "%d", &domainID); err != nil {
+		// Try to find by domain name
+		var domainByName database.MonitoredDomain
+		if err := database.DB.Where("domain_name = ?", idParam).First(&domainByName).Error; err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "domain not found"})
+			return
+		}
+		domainID = domainByName.ID
+	}
+
+	// Get heartbeats from last 24 hours
+	since := time.Now().AddDate(0, 0, -1)
+	var heartbeats []database.Heartbeat
+	if err := database.DB.Where("domain_id = ? AND created_at >= ?", domainID, since).
+		Order("created_at asc").
+		Find(&heartbeats).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch heartbeats"})
+		return
+	}
+
+	// Get last 50 heartbeats for uptime bar
+	var recentHeartbeats []database.Heartbeat
+	if err := database.DB.Where("domain_id = ?", domainID).
+		Order("created_at desc").
+		Limit(50).
+		Find(&recentHeartbeats).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch recent heartbeats"})
+		return
+	}
+
+	// Calculate uptime percentage from last 50 checks
+	successCount := 0
+	for _, hb := range recentHeartbeats {
+		if hb.StatusCode >= 200 && hb.StatusCode < 400 {
+			successCount++
+		}
+	}
+	uptimePercent := 0.0
+	if len(recentHeartbeats) > 0 {
+		uptimePercent = float64(successCount) / float64(len(recentHeartbeats)) * 100.0
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"heartbeats_24h": heartbeats,
+		"recent_50":      recentHeartbeats,
+		"uptime_percent": uptimePercent,
+		"total_checks":   len(recentHeartbeats),
+		"success_count":  successCount,
+	})
+}
+
 // handleScan processes the scan request
 func handleScan(c *gin.Context) {
 	// Get domains from query parameter
@@ -4821,35 +6597,62 @@ func handleScan(c *gin.Context) {
 			err := database.DB.Where("domain_name = ?", result.DomainName).First(&existingDomain).Error
 
 			updateData := map[string]interface{}{
-				"ssl_expiry":      result.ExpiryDate,
 				"ssl_status":      sslStatus,
 				"last_check_time": now,
 				"status":          status,
+			}
+
+			// Only persist ssl_expiry if we actually got a real expiry date (avoid writing 0001-01-01)
+			if !result.ExpiryDate.IsZero() {
+				updateData["ssl_expiry"] = result.ExpiryDate
 			}
 
 			if !result.DomainExpiryDate.IsZero() {
 				updateData["last_expiry_date"] = result.DomainExpiryDate
 			}
 
+			// Auto-populate Registrar from scan result
 			if result.Registrar != "" {
 				updateData["registrar"] = result.Registrar
 			}
 
+			// Auto-populate Issuer from SSL certificate
+			if result.Issuer != "" {
+				updateData["issuer"] = result.Issuer
+			}
+
 			if err != nil {
-				// Domain doesn't exist, create new
-				newDomain := database.MonitoredDomain{
-					DomainName:     result.DomainName,
-					SSLExpiry:      result.ExpiryDate,
-					SSLStatus:      sslStatus,
-					LastCheckTime:  now,
-					Status:         status,
-					LastExpiryDate: result.DomainExpiryDate,
-					Registrar:      result.Registrar,
-					AutoRenew:      false,
+				// Domain doesn't exist, create new with auto-populated info and default tags
+				defaultTags := "scanned"
+				if result.Registrar != "" {
+					defaultTags = "scanned," + strings.ToLower(result.Registrar)
 				}
-				database.DB.Create(&newDomain)
+				newDomain := database.MonitoredDomain{
+					DomainName:    result.DomainName,
+					SSLStatus:     sslStatus,
+					LastCheckTime: now,
+					Status:        status,
+					Registrar:     result.Registrar,
+					Issuer:        result.Issuer,
+					AutoRenew:     true,
+					Tags:          defaultTags,
+					CustomStatus:  "",
+				}
+				// Only set SSLExpiry if we have a real expiry date (avoid 0001-01-01)
+				if !result.ExpiryDate.IsZero() {
+					newDomain.SSLExpiry = result.ExpiryDate
+				}
+				// Only set LastExpiryDate if we have a real date
+				if !result.DomainExpiryDate.IsZero() {
+					newDomain.LastExpiryDate = result.DomainExpiryDate
+				}
+				if createErr := database.DB.Create(&newDomain).Error; createErr != nil {
+					log.Printf("Failed to create domain %s: %v", result.DomainName, createErr)
+				} else if result.ExpiryDate.IsZero() {
+					log.Printf("Domain %s created but SSL expiry date is zero (scan may have failed)", result.DomainName)
+				}
 			} else {
-				// Update existing domain
+				// Update existing domain (preserve Tags and CustomStatus if not updating)
 				database.DB.Model(&existingDomain).Updates(updateData)
 			}
 		}
@@ -5219,17 +7022,19 @@ func scanAllDomainsSSL() {
 
 // HealthCheckResult represents the result of an HTTP health check
 type HealthCheckResult struct {
-	DomainName   string
-	IsLive       bool
-	StatusCode   int
-	ResponseTime int // in milliseconds
+	DomainName    string
+	IsLive        bool
+	StatusCode    int
+	ResponseTime  int // Total response time in milliseconds
+	DNSLookup     int // DNS lookup time in milliseconds
+	TCPConnection int // TCP connection time in milliseconds
+	TLSHandshake  int // TLS handshake time in milliseconds (0 for HTTP)
+	TTFB          int // Time to First Byte in milliseconds
 }
 
-// checkDomainHealth performs an HTTP health check on a domain using http.Get
-// Uses http.Client with 5s timeout to make GET requests
+// checkDomainHealth performs an HTTP health check on a domain using httptrace
+// Captures detailed timing metrics: DNS lookup, TCP connection, TLS handshake, TTFB
 func checkDomainHealth(domainName string) HealthCheckResult {
-	startTime := time.Now()
-
 	// Try HTTPS first, then HTTP
 	urls := []string{
 		"https://" + domainName,
@@ -5241,33 +7046,143 @@ func checkDomainHealth(domainName string) HealthCheckResult {
 	}
 
 	for _, urlStr := range urls {
-		// Use http.Get as requested
-		resp, err := client.Get(urlStr)
-		if err != nil {
-			continue
-		}
-		defer resp.Body.Close()
-
-		// Calculate response time
-		responseTime := int(time.Since(startTime).Milliseconds())
-
-		// Consider 2xx and 3xx status codes as "live"
-		isLive := resp.StatusCode >= 200 && resp.StatusCode < 400
-
-		return HealthCheckResult{
-			DomainName:   domainName,
-			IsLive:       isLive,
-			StatusCode:   resp.StatusCode,
-			ResponseTime: responseTime,
+		result := checkDomainHealthWithTrace(client, urlStr, domainName)
+		if result.IsLive {
+			return result
 		}
 	}
 
 	// If both HTTPS and HTTP failed, domain is not live
 	return HealthCheckResult{
-		DomainName:   domainName,
-		IsLive:       false,
-		StatusCode:   0,
-		ResponseTime: int(time.Since(startTime).Milliseconds()),
+		DomainName:    domainName,
+		IsLive:        false,
+		StatusCode:    0,
+		ResponseTime:  0,
+		DNSLookup:     0,
+		TCPConnection: 0,
+		TLSHandshake:  0,
+		TTFB:          0,
+	}
+}
+
+// checkDomainHealthWithTrace performs HTTP request with detailed timing using httptrace
+func checkDomainHealthWithTrace(client *http.Client, urlStr, domainName string) HealthCheckResult {
+	var dnsStart, dnsDone, connectStart, connectDone, tlsStart, tlsDone, gotFirstByte time.Time
+	var dnsLookup, tcpConnection, tlsHandshake, ttfb int
+
+	startTime := time.Now()
+
+	// Create request with context
+	req, err := http.NewRequest("GET", urlStr, nil)
+	if err != nil {
+		return HealthCheckResult{
+			DomainName:    domainName,
+			IsLive:        false,
+			StatusCode:    0,
+			ResponseTime:  int(time.Since(startTime).Milliseconds()),
+			DNSLookup:     0,
+			TCPConnection: 0,
+			TLSHandshake:  0,
+			TTFB:          0,
+		}
+	}
+
+	// Create trace context
+	trace := &httptrace.ClientTrace{
+		DNSStart: func(dsi httptrace.DNSStartInfo) {
+			dnsStart = time.Now()
+		},
+		DNSDone: func(ddi httptrace.DNSDoneInfo) {
+			dnsDone = time.Now()
+			if dnsDone.After(dnsStart) {
+				dnsLookup = int(dnsDone.Sub(dnsStart).Milliseconds())
+			}
+		},
+		ConnectStart: func(network, addr string) {
+			connectStart = time.Now()
+		},
+		ConnectDone: func(network, addr string, err error) {
+			connectDone = time.Now()
+			if connectDone.After(connectStart) {
+				// TCP connection time is the duration between ConnectStart and ConnectDone
+				tcpConnection = int(connectDone.Sub(connectStart).Milliseconds())
+			}
+		},
+		TLSHandshakeStart: func() {
+			tlsStart = time.Now()
+		},
+		TLSHandshakeDone: func(cs tls.ConnectionState, err error) {
+			tlsDone = time.Now()
+			if tlsDone.After(tlsStart) {
+				tlsHandshake = int(tlsDone.Sub(tlsStart).Milliseconds())
+			}
+		},
+		GotFirstResponseByte: func() {
+			gotFirstByte = time.Now()
+			// Calculate TTFB from connection done (or TLS done if HTTPS)
+			if !tlsDone.IsZero() {
+				ttfb = int(gotFirstByte.Sub(tlsDone).Milliseconds())
+			} else if !connectDone.IsZero() {
+				ttfb = int(gotFirstByte.Sub(connectDone).Milliseconds())
+			} else {
+				ttfb = int(gotFirstByte.Sub(startTime).Milliseconds())
+			}
+		},
+	}
+
+	// Add trace to request context
+	ctx := httptrace.WithClientTrace(req.Context(), trace)
+	req = req.WithContext(ctx)
+
+	// Perform request
+	resp, err := client.Do(req)
+	if err != nil {
+		// Calculate total time even on error
+		totalTime := int(time.Since(startTime).Milliseconds())
+		return HealthCheckResult{
+			DomainName:    domainName,
+			IsLive:        false,
+			StatusCode:    0,
+			ResponseTime:  totalTime,
+			DNSLookup:     dnsLookup,
+			TCPConnection: tcpConnection,
+			TLSHandshake:  tlsHandshake,
+			TTFB:          ttfb,
+		}
+	}
+	defer resp.Body.Close()
+
+	// Calculate total response time
+	responseTime := int(time.Since(startTime).Milliseconds())
+
+	// Consider 2xx and 3xx status codes as "live"
+	isLive := resp.StatusCode >= 200 && resp.StatusCode < 400
+
+	// If some metrics are still 0, try to estimate from total time
+	if dnsLookup == 0 && tcpConnection == 0 && tlsHandshake == 0 && ttfb == 0 {
+		// Fallback: estimate proportions (rough approximation)
+		if tlsHandshake > 0 {
+			// HTTPS: assume DNS 10%, TCP 20%, TLS 40%, TTFB 30%
+			dnsLookup = responseTime * 10 / 100
+			tcpConnection = responseTime * 20 / 100
+			ttfb = responseTime * 30 / 100
+		} else {
+			// HTTP: assume DNS 20%, TCP 30%, TTFB 50%
+			dnsLookup = responseTime * 20 / 100
+			tcpConnection = responseTime * 30 / 100
+			ttfb = responseTime * 50 / 100
+		}
+	}
+
+	return HealthCheckResult{
+		DomainName:    domainName,
+		IsLive:        isLive,
+		StatusCode:    resp.StatusCode,
+		ResponseTime:  responseTime,
+		DNSLookup:     dnsLookup,
+		TCPConnection: tcpConnection,
+		TLSHandshake:  tlsHandshake,
+		TTFB:          ttfb,
 	}
 }
 
@@ -5276,14 +7191,39 @@ func checkDomainHealth(domainName string) HealthCheckResult {
 func startLiveMonitor() {
 	// Run immediately on startup
 	checkAllDomainsHealth()
+	cleanupOldHeartbeats()
 
 	// Use a ticker that runs every 2 minutes
 	ticker := time.NewTicker(2 * time.Minute)
 	defer ticker.Stop()
 
+	// Cleanup ticker - runs every 6 hours to keep only last 24 hours of data
+	cleanupTicker := time.NewTicker(6 * time.Hour)
+	defer cleanupTicker.Stop()
+
 	// Periodic checks
-	for range ticker.C {
-		checkAllDomainsHealth()
+	for {
+		select {
+		case <-ticker.C:
+			checkAllDomainsHealth()
+		case <-cleanupTicker.C:
+			cleanupOldHeartbeats()
+		}
+	}
+}
+
+// cleanupOldHeartbeats removes heartbeats older than 24 hours to ensure performance
+func cleanupOldHeartbeats() {
+	if database.DB == nil {
+		return
+	}
+
+	cutoff := time.Now().Add(-24 * time.Hour) // Keep only last 24 hours
+	result := database.DB.Where("created_at < ?", cutoff).Delete(&database.Heartbeat{})
+	if result.Error != nil {
+		log.Printf("Error cleaning up old heartbeats: %v", result.Error)
+	} else if result.RowsAffected > 0 {
+		log.Printf("Cleaned up %d old heartbeats (older than 24 hours)", result.RowsAffected)
 	}
 }
 
@@ -5378,6 +7318,22 @@ func checkAllDomainsHealth() {
 			log.Printf("Error updating domain health %s: %v", res.domain.DomainName, err)
 		} else {
 			updated++
+
+			// Record heartbeat for charting with detailed metrics
+			heartbeat := database.Heartbeat{
+				DomainID:      res.domain.ID,
+				Latency:       res.result.ResponseTime,
+				StatusCode:    res.result.StatusCode,
+				DNSLookup:     res.result.DNSLookup,
+				TCPConnection: res.result.TCPConnection,
+				TLSHandshake:  res.result.TLSHandshake,
+				TTFB:          res.result.TTFB,
+				NodeLocation:  "Japan-Nagoya", // Default monitoring node location
+				CreatedAt:     time.Now(),
+			}
+			if err := database.DB.Create(&heartbeat).Error; err != nil {
+				log.Printf("Error creating heartbeat for domain %s: %v", res.domain.DomainName, err)
+			}
 
 			// Trigger Telegram notification if site transitions from Live to Down
 			if wasLive && !nowLive {
@@ -5937,7 +7893,7 @@ func sendTelegram(message string) error {
 	// Prepare request payload
 	payload := map[string]string{
 		"chat_id": config.ChatID,
-		"text":     message,
+		"text":    message,
 	}
 
 	jsonData, err := json.Marshal(payload)
@@ -6000,12 +7956,16 @@ func performSSLScan() {
 
 	for _, monitoredDomain := range domains {
 		result := domain.CheckCertificate(monitoredDomain.DomainName)
-		
+
 		// Update domain record with SSL expiry information
 		updates := map[string]interface{}{
-			"ssl_expiry":      result.ExpiryDate,
-			"last_expiry_date": result.ExpiryDate,
-			"status":          getStatus(result),
+			"status": getStatus(result),
+		}
+
+		// Only persist ssl_expiry if we actually got a real expiry date (avoid writing 0001-01-01)
+		if !result.ExpiryDate.IsZero() {
+			updates["ssl_expiry"] = result.ExpiryDate
+			updates["last_expiry_date"] = result.ExpiryDate
 		}
 
 		if err := database.DB.Model(&monitoredDomain).Updates(updates).Error; err != nil {
@@ -6079,7 +8039,7 @@ func performHTTPHealthChecks() {
 
 		// Update domain record
 		updates := map[string]interface{}{
-			"is_live":         isLive,
+			"is_live":          isLive,
 			"last_status_code": statusCode,
 		}
 
@@ -6097,4 +8057,3 @@ func performHTTPHealthChecks() {
 		}
 	}
 }
-

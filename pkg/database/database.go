@@ -44,6 +44,7 @@ type MonitoredDomain struct {
 	DomainName           string    `gorm:"uniqueIndex" json:"domain_name"`
 	LastExpiryDate       time.Time `json:"last_expiry_date"`
 	Registrar            string    `json:"registrar"`
+	Issuer               string    `json:"issuer"` // SSL certificate issuer
 	Status               string    `json:"status"`
 	SSLExpiry            time.Time `json:"ssl_expiry"`
 	SSLStatus            string    `json:"ssl_status"`
@@ -54,6 +55,22 @@ type MonitoredDomain struct {
 	StatusCode           int       `json:"status_code" gorm:"default:0"`
 	LastStatusCode       int       `json:"last_status_code" gorm:"default:0"` // Last HTTP status code received
 	ResponseTime         int       `json:"response_time" gorm:"default:0"`    // Response time in milliseconds
+	Tags                 string    `json:"tags" gorm:"type:text"`            // Comma-separated tags for categorization
+	CustomStatus         string    `json:"custom_status"`                     // User-defined status (e.g., "Testing", "Production", "Pending Migration")
+}
+
+// Heartbeat represents a single health check result for a monitored domain
+type Heartbeat struct {
+	ID            uint      `gorm:"primaryKey" json:"id"`
+	DomainID      uint      `gorm:"index" json:"domain_id"`                     // Foreign key to MonitoredDomain
+	Latency       int       `json:"latency"`                                    // Total response time in milliseconds
+	StatusCode    int       `json:"status_code"`                                // HTTP status code (0 if unreachable)
+	DNSLookup     int       `json:"dns_lookup"`                                 // DNS lookup time in milliseconds
+	TCPConnection int       `json:"tcp_connection"`                             // TCP connection time in milliseconds
+	TLSHandshake  int       `json:"tls_handshake"`                               // TLS handshake time in milliseconds (0 for HTTP)
+	TTFB          int       `json:"ttfb"`                                       // Time to First Byte in milliseconds
+	NodeLocation  string    `json:"node_location" gorm:"default:'Japan-Tokyo'"` // Monitoring node location
+	CreatedAt     time.Time `gorm:"index" json:"created_at"`                    // Timestamp of the check
 }
 
 // User represents an authenticated platform user.
@@ -127,6 +144,7 @@ func Init() error {
 			&Project{},
 			&InfrastructureResource{},
 			&MonitoredDomain{},
+			&Heartbeat{},
 			&User{},
 			&NotificationConfig{},
 			&MessageTemplate{},
