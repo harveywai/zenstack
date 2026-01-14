@@ -48,7 +48,7 @@ type MonitoredDomain struct {
 	SSLExpiry            time.Time `json:"ssl_expiry"`
 	SSLStatus            string    `json:"ssl_status"`
 	LastCheckTime        time.Time `json:"last_check_time"`
-	AutoRenew            bool      `json:"auto_renew" gorm:"default:false"`
+	AutoRenew            bool      `json:"auto_renew" gorm:"default:true"` // 续费提醒开关
 	LastNotificationSent time.Time `json:"last_notification_sent" gorm:"column:last_notification_sent"`
 	IsLive               bool      `json:"is_live" gorm:"default:false"`
 	StatusCode           int       `json:"status_code" gorm:"default:0"`
@@ -86,6 +86,7 @@ type MessageTemplate struct {
 	BodyTemplate  string    `json:"body_template" gorm:"column:body_template"`
 	Name          string    `json:"name" gorm:"column:name"`                   // Type: "SiteDown", "SSLExpired"
 	TemplateText  string    `json:"template_text" gorm:"column:template_text"` // Content: Template text for Telegram
+	Template      string    `gorm:"type:text" json:"template"`                 // Alias for TemplateText (backward compatibility)
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
 }
@@ -97,6 +98,16 @@ type NotifyConfig struct {
 	TGToken   string    `json:"tg_token" gorm:"column:tg_token"`     // Telegram bot token (BotToken)
 	TGChatID  string    `json:"tg_chat_id" gorm:"column:tg_chat_id"` // Telegram chat ID (ChatID)
 	IsActive  bool      `json:"is_active" gorm:"default:true"`       // IsEnabled flag
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// TelegramConfig stores Telegram bot configuration for notifications (backward compatibility alias)
+type TelegramConfig struct {
+	ID        uint      `gorm:"primaryKey" json:"id"`
+	BotToken  string    `gorm:"uniqueIndex" json:"bot_token"`
+	ChatID    string    `json:"chat_id"`
+	Enabled   bool      `gorm:"default:true" json:"enabled"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -120,6 +131,7 @@ func Init() error {
 			&NotificationConfig{},
 			&MessageTemplate{},
 			&NotifyConfig{},
+			&TelegramConfig{}, // Backward compatibility
 		); err != nil {
 			initErr = err
 			return

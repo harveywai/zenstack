@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"log"
 	"math"
@@ -140,10 +142,10 @@ func main() {
 		v1Dashboard.GET("/stats", handleDashboardStats)
 	}
 
-	// Start background SSL monitoring task
+	// Start background SSL monitoring task (new version with deep scan)
 	go startSSLScanner()
 
-	// Start background HTTP health monitoring worker
+	// Start background HTTP health monitoring worker (new version)
 	go startLiveMonitor()
 
 	// Start server
@@ -3182,7 +3184,7 @@ func handleDashboard(c *gin.Context) {
 
         // Wire up event listeners once the DOM is ready
         document.addEventListener("DOMContentLoaded", function () {
-            // Sidebar view switching
+            // Sidebar view switching (with existence checks to prevent blocking login page)
             const navDashboard = document.getElementById("nav-dashboard");
             if (navDashboard) {
                 navDashboard.addEventListener("click", function () {
@@ -3226,7 +3228,7 @@ func handleDashboard(c *gin.Context) {
                 setActiveView("dashboard");
             }
 
-            // Scanner actions
+            // Scanner actions (with existence checks)
             const scanButton = document.getElementById("scan-button");
             if (scanButton) {
                 scanButton.addEventListener("click", function () {
@@ -5903,3 +5905,196 @@ func handleTestTelegramConnection(c *gin.Context) {
 		"chat_id": config.TGChatID,
 	})
 }
+
+// sendTelegram sends a notification message to Telegram using configured bot token and chat ID.
+// It retrieves the configuration from the database and handles network timeouts appropriately.
+// This is a legacy function kept for backward compatibility.
+func sendTelegram(message string) error {
+	if database.DB == nil {
+		return fmt.Errorf("database not initialized")
+	}
+
+	var config database.TelegramConfig
+	if err := database.DB.Where("enabled = ?", true).First(&config).Error; err != nil {
+		// No Telegram config found or disabled - not an error, just skip notification
+		log.Printf("Telegram notification skipped: %v", err)
+		return nil
+	}
+
+	if config.BotToken == "" || config.ChatID == "" {
+		log.Printf("Telegram notification skipped: bot token or chat ID not configured")
+		return nil
+	}
+
+	// Create HTTP client with timeout for Japan-to-Global requests
+	client := &http.Client{
+		Timeout: 15 * time.Second, // Important: timeout for network requests
+	}
+
+	// Telegram Bot API endpoint
+	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", config.BotToken)
+
+	// Prepare request payload
+	payload := map[string]string{
+		"chat_id": config.ChatID,
+		"text":     message,
+	}
+
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal Telegram payload: %w", err)
+	}
+
+	// Send request with timeout handling
+	req, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return fmt.Errorf("failed to create Telegram request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		// Network timeout or connection error
+		log.Printf("Telegram notification failed (network error): %v", err)
+		return fmt.Errorf("telegram network error: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("Telegram notification failed with status %d", resp.StatusCode)
+		return fmt.Errorf("telegram API returned status %d", resp.StatusCode)
+	}
+
+	log.Printf("Telegram notification sent successfully")
+	return nil
+}
+
+// startSSLMonitoring starts a background goroutine that periodically scans SSL certificates
+// for all monitored domains using a non-blocking time.Ticker.
+func startSSLMonitoring() {
+	ticker := time.NewTicker(1 * time.Hour) // Check every hour
+	defer ticker.Stop()
+
+	log.Println("SSL monitoring goroutine started")
+
+	// Run initial scan immediately
+	go performSSLScan()
+
+	// Periodic scans
+	for range ticker.C {
+		go performSSLScan()
+	}
+}
+
+// performSSLScan scans all monitored domains for SSL certificate expiry.
+func performSSLScan() {
+	if database.DB == nil {
+		return
+	}
+
+	var domains []database.MonitoredDomain
+	if err := database.DB.Find(&domains).Error; err != nil {
+		log.Printf("Failed to load monitored domains for SSL scan: %v", err)
+		return
+	}
+
+	for _, monitoredDomain := range domains {
+		result := domain.CheckCertificate(monitoredDomain.DomainName)
+		
+		// Update domain record with SSL expiry information
+		updates := map[string]interface{}{
+			"ssl_expiry":      result.ExpiryDate,
+			"last_expiry_date": result.ExpiryDate,
+			"status":          getStatus(result),
+		}
+
+		if err := database.DB.Model(&monitoredDomain).Updates(updates).Error; err != nil {
+			log.Printf("Failed to update SSL expiry for domain %s: %v", monitoredDomain.DomainName, err)
+			continue
+		}
+
+		// Send notification if certificate is critical or expired
+		if result.DaysRemaining < criticalThreshold || result.Status == "Expired" {
+			message := fmt.Sprintf("⚠️ SSL Alert: %s - %s (Days remaining: %d)",
+				monitoredDomain.DomainName, result.Status, result.DaysRemaining)
+			if err := sendTelegram(message); err != nil {
+				log.Printf("Failed to send Telegram notification: %v", err)
+			}
+		}
+	}
+}
+
+// startHTTPHealthChecks starts a background goroutine that periodically performs HTTP health checks
+// for all monitored domains using a non-blocking time.Ticker.
+func startHTTPHealthChecks() {
+	ticker := time.NewTicker(5 * time.Minute) // Check every 5 minutes
+	defer ticker.Stop()
+
+	log.Println("HTTP health check goroutine started")
+
+	// Run initial check immediately
+	go performHTTPHealthChecks()
+
+	// Periodic checks
+	for range ticker.C {
+		go performHTTPHealthChecks()
+	}
+}
+
+// performHTTPHealthChecks performs HTTP health checks for all monitored domains.
+func performHTTPHealthChecks() {
+	if database.DB == nil {
+		return
+	}
+
+	var domains []database.MonitoredDomain
+	if err := database.DB.Find(&domains).Error; err != nil {
+		log.Printf("Failed to load monitored domains for health check: %v", err)
+		return
+	}
+
+	client := &http.Client{
+		Timeout: 10 * time.Second, // Timeout for health checks
+	}
+
+	for _, monitoredDomain := range domains {
+		// Try HTTPS first, then HTTP
+		urls := []string{
+			fmt.Sprintf("https://%s", monitoredDomain.DomainName),
+			fmt.Sprintf("http://%s", monitoredDomain.DomainName),
+		}
+
+		var isLive bool
+		var statusCode int
+
+		for _, urlStr := range urls {
+			resp, err := client.Get(urlStr)
+			if err == nil {
+				resp.Body.Close()
+				isLive = true
+				statusCode = resp.StatusCode
+				break
+			}
+		}
+
+		// Update domain record
+		updates := map[string]interface{}{
+			"is_live":         isLive,
+			"last_status_code": statusCode,
+		}
+
+		if err := database.DB.Model(&monitoredDomain).Updates(updates).Error; err != nil {
+			log.Printf("Failed to update health status for domain %s: %v", monitoredDomain.DomainName, err)
+			continue
+		}
+
+		// Send notification if domain goes down
+		if !isLive {
+			message := fmt.Sprintf("🔴 Domain Down: %s is not reachable", monitoredDomain.DomainName)
+			if err := sendTelegram(message); err != nil {
+				log.Printf("Failed to send Telegram notification: %v", err)
+			}
+		}
+	}
+}
+
